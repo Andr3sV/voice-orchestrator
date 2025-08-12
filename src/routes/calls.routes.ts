@@ -6,6 +6,23 @@ import { prisma } from '../lib/prisma.js';
 import { v4 as uuidv4 } from 'uuid';
 import { aggregateDailyFor, purgeOldCalls } from '../queues/calls.worker.js';
 
+// Simple API key auth per workspace
+async function authenticateWorkspace(request: any) {
+  const authHeader = (request.headers?.authorization as string | undefined) ?? (request.headers?.['x-workspace-key'] as string | undefined);
+  if (!authHeader) {
+    throw Object.assign(new Error('Missing Authorization header'), { statusCode: 401 });
+  }
+  const apiKey = authHeader.startsWith('Bearer ')
+    ? authHeader.substring('Bearer '.length).trim()
+    : authHeader.trim();
+
+  const ws = await prisma.workspace.findUnique({ where: { apiKey } });
+  if (!ws) {
+    throw Object.assign(new Error('Invalid API key'), { statusCode: 401 });
+  }
+  return ws;
+}
+
 const createPrioritySchema = z.object({
   workspaceId: z.string().min(1),
   agentId: z.string().min(1),
@@ -84,6 +101,7 @@ const reportQuerySchema = z.object({
 export async function registerCallsRoutes(app: FastifyInstance) {
   // Manual daily aggregate + purge endpoint
   app.post('/calls/aggregate/run', async (request, reply) => {
+    const ws = await authenticateWorkspace(request);
     const schema = z.object({ date: z.string().date().optional() });
     const { date } = schema.parse(request.body ?? {});
     const target = date ?? new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
@@ -94,7 +112,12 @@ export async function registerCallsRoutes(app: FastifyInstance) {
 
   // List paginated calls
   app.get('/calls', async (request, reply) => {
+    const ws = await authenticateWorkspace(request);
     const q = listCallsQuerySchema.parse(request.query);
+
+    if (q.workspaceId !== ws.id) {
+      return reply.code(403).send({ error: 'Forbidden: workspaceId mismatch' });
+    }
 
     const where: any = { workspaceId: q.workspaceId };
     if (q.status) where.status = q.status;
@@ -134,7 +157,11 @@ export async function registerCallsRoutes(app: FastifyInstance) {
 
   // Aggregated report
   app.get('/calls/report', async (request, reply) => {
+    const ws = await authenticateWorkspace(request);
     const q = reportQuerySchema.parse(request.query);
+    if (q.workspaceId !== ws.id) {
+      return reply.code(403).send({ error: 'Forbidden: workspaceId mismatch' });
+    }
     const from = new Date(q.from);
     const to = new Date(q.to);
 
@@ -195,7 +222,11 @@ export async function registerCallsRoutes(app: FastifyInstance) {
 
   // Priority create (on-time)
   app.post('/calls/priority', async (request, reply) => {
+    const ws = await authenticateWorkspace(request);
     const body = createPrioritySchema.parse(request.body);
+    if (body.workspaceId !== ws.id) {
+      return reply.code(403).send({ error: 'Forbidden: workspaceId mismatch' });
+    }
     await ensureWorkspaceAndAgent(body.workspaceId, body.agentId);
     const call = await prisma.call.create({
       data: {
@@ -229,7 +260,11 @@ export async function registerCallsRoutes(app: FastifyInstance) {
 
   // Bulk create (queued)
   app.post('/calls/bulk', async (request, reply) => {
+    const ws = await authenticateWorkspace(request);
     const body = createBulkSchema.parse(request.body);
+    if (body.workspaceId !== ws.id) {
+      return reply.code(403).send({ error: 'Forbidden: workspaceId mismatch' });
+    }
     await ensureWorkspaceAndAgent(body.workspaceId, body.agentId);
     const jobs = body.calls.map((c) => {
       const payload: {
