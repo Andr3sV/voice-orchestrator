@@ -1,0 +1,100 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Workspace {
+  id           String   @id @default(cuid())
+  name         String
+  apiKey       String   @unique
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  phoneNumbers WorkspacePhoneNumber[]
+  agents       Agent[]
+  campaigns    Campaign[]
+  calls        Call[]
+  callDailyAggregates CallDailyAggregate[]
+}
+
+model WorkspacePhoneNumber {
+  id          String   @id @default(cuid())
+  workspace   Workspace @relation(fields: [workspaceId], references: [id])
+  workspaceId String
+  e164        String
+  label       String?
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  @@unique([workspaceId, e164])
+}
+
+model Agent {
+  id                 String   @id @default(cuid())
+  workspace          Workspace @relation(fields: [workspaceId], references: [id])
+  workspaceId        String
+  name               String
+  elevenLabsAgentId  String
+  defaultLocale      String?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+  calls              Call[]
+  callDailyAggregates CallDailyAggregate[]
+}
+
+model Campaign {
+  id           String   @id @default(cuid())
+  workspace    Workspace @relation(fields: [workspaceId], references: [id])
+  workspaceId  String
+  externalId   String?
+  name         String?
+  status       String   @default("active")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  calls        Call[]
+}
+
+model Call {
+  id           String   @id @default(cuid())
+  workspace    Workspace @relation(fields: [workspaceId], references: [id])
+  workspaceId  String
+  agent        Agent     @relation(fields: [agentId], references: [id])
+  agentId      String
+  campaign     Campaign? @relation(fields: [campaignId], references: [id])
+  campaignId   String?
+  to           String
+  from         String
+  status       String   @default("queued")
+  priority     Int      @default(0)
+  metadata     Json?
+  externalRef  String? // e.g., ElevenLabs call id
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([workspaceId, createdAt])
+  @@index([workspaceId, status, createdAt])
+}
+
+model CallDailyAggregate {
+  id           String   @id @default(cuid())
+  date         DateTime
+  workspace    Workspace @relation(fields: [workspaceId], references: [id])
+  workspaceId  String
+  agent        Agent     @relation(fields: [agentId], references: [id])
+  agentId      String
+
+  queued       Int      @default(0)
+  in_progress  Int      @default(0)
+  completed    Int      @default(0)
+  failed       Int      @default(0)
+  total        Int      @default(0)
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@unique([date, workspaceId, agentId])
+  @@index([workspaceId, date])
+}
