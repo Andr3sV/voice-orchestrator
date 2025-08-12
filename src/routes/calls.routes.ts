@@ -23,6 +23,17 @@ async function authenticateWorkspace(request: any) {
   return ws;
 }
 
+function requireAdmin(request: any) {
+  const hdr = (request.headers?.authorization as string | undefined) ?? '';
+  const token = hdr.startsWith('Bearer ') ? hdr.slice(7).trim() : hdr.trim();
+  const expected = process.env.ORCHESTRATOR_ADMIN_TOKEN ?? '';
+  if (!expected || token !== expected) {
+    const err: any = new Error('Unauthorized');
+    err.statusCode = 401;
+    throw err;
+  }
+}
+
 const createPrioritySchema = z.object({
   workspaceId: z.string().min(1),
   agentId: z.string().min(1),
@@ -99,6 +110,32 @@ const reportQuerySchema = z.object({
 });
 
 export async function registerCallsRoutes(app: FastifyInstance) {
+  // Admin: provision or fetch workspace API key
+  app.post('/workspaces/provision', async (request, reply) => {
+    requireAdmin(request);
+    const schema = z.object({ workspaceId: z.string().min(1), name: z.string().optional() });
+    const { workspaceId, name } = schema.parse(request.body ?? {});
+    const existing = await prisma.workspace.findUnique({ where: { id: workspaceId } });
+    if (existing) {
+      return reply.send({ workspaceId: existing.id, apiKey: existing.apiKey });
+    }
+    const created = await prisma.workspace.create({
+      data: { id: workspaceId, name: name ?? workspaceId, apiKey: `auto_${uuidv4()}` },
+    });
+    return reply.code(201).send({ workspaceId: created.id, apiKey: created.apiKey });
+  });
+
+  // Admin: inspect workspace (masked apiKey)
+  app.get('/workspaces/:id', async (request, reply) => {
+    requireAdmin(request);
+    const schema = z.object({ id: z.string().min(1) });
+    const params = schema.parse(request.params);
+    const ws = await prisma.workspace.findUnique({ where: { id: params.id } });
+    if (!ws) return reply.code(404).send({ error: 'Not found' });
+    const masked = ws.apiKey.length > 6 ? `${ws.apiKey.slice(0, 3)}***${ws.apiKey.slice(-3)}` : '***';
+    return reply.send({ id: ws.id, name: ws.name, apiKeyMasked: masked });
+  });
+
   // Manual daily aggregate + purge endpoint
   app.post('/calls/aggregate/run', async (request, reply) => {
     const ws = await authenticateWorkspace(request);
