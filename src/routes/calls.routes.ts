@@ -49,6 +49,7 @@ const createBulkSchema = z.object({
   agentId: z.string().min(1),
   agentPhoneNumberId: z.string().optional(),
   fromNumber: z.string().min(5).optional(),
+  campaignId: z.string().optional(),
   calls: z
     .array(
       z.object({
@@ -312,6 +313,7 @@ export async function registerCallsRoutes(app: FastifyInstance) {
         toNumber: string;
         metadata?: Record<string, unknown>;
         variables: Record<string, unknown>;
+        campaignId?: string;
       } = {
         workspaceId: body.workspaceId,
         agentId: body.agentId,
@@ -321,6 +323,7 @@ export async function registerCallsRoutes(app: FastifyInstance) {
       };
       if (body.agentPhoneNumberId) payload.agentPhoneNumberId = body.agentPhoneNumberId;
       if (c.metadata) payload.metadata = c.metadata;
+      if (body.campaignId) payload.campaignId = body.campaignId;
       return { jobType: 'BULK' as const, payload };
     });
 
@@ -328,6 +331,7 @@ export async function registerCallsRoutes(app: FastifyInstance) {
       data: jobs.map((j) => ({
         workspaceId: j.payload.workspaceId,
         agentId: j.payload.agentId,
+        campaignId: j.payload.campaignId ?? null,
         to: j.payload.toNumber,
         from: j.payload.fromNumber,
         status: 'queued',
@@ -338,6 +342,32 @@ export async function registerCallsRoutes(app: FastifyInstance) {
 
     const res = await addBulkCalls(jobs);
     return reply.code(202).send({ enqueued: res.length });
+  });
+
+  // Usage: total minutes/seconds by campaign
+  app.get('/calls/usage', async (request, reply) => {
+    const ws = await authenticateWorkspace(request);
+    const schema = z.object({
+      workspaceId: z.string().min(1),
+      campaignId: z.string().min(1),
+      from: z.string().datetime().optional(),
+      to: z.string().datetime().optional(),
+    });
+    const q = schema.parse(request.query);
+    if (q.workspaceId !== ws.id) return reply.code(403).send({ error: 'Forbidden: workspaceId mismatch' });
+
+    const where: any = { workspaceId: q.workspaceId, campaignId: q.campaignId };
+    if (q.from || q.to) {
+      where.createdAt = {} as any;
+      if (q.from) where.createdAt.gte = new Date(q.from);
+      if (q.to) where.createdAt.lte = new Date(q.to);
+    }
+
+    const rows = await prisma.call.findMany({ where, select: { durationSeconds: true, status: true } });
+    const totalSeconds = rows.reduce((s, r) => s + (r.durationSeconds ?? 0), 0);
+    const completed = rows.filter((r) => r.status === 'completed').length;
+    const failed = rows.filter((r) => r.status === 'failed').length;
+    return reply.send({ totalSeconds, totalMinutes: Math.round(totalSeconds / 60), completed, failed });
   });
 }
 

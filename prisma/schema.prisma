@@ -71,6 +71,7 @@ model Call {
   priority     Int      @default(0)
   metadata     Json?
   externalRef  String? // e.g., ElevenLabs call id
+  durationSeconds Int?
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
