@@ -11,8 +11,8 @@ model Workspace {
   id           String   @id @default(cuid())
   name         String
   apiKey       String   @unique
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
+  createdAt    DateTime @default(now()) @db.Timestamptz
+  updatedAt    DateTime @updatedAt       @db.Timestamptz
   phoneNumbers WorkspacePhoneNumber[]
   agents       Agent[]
   campaigns    Campaign[]
@@ -27,8 +27,8 @@ model WorkspacePhoneNumber {
   e164        String
   label       String?
   active      Boolean  @default(true)
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  createdAt   DateTime @default(now()) @db.Timestamptz
+  updatedAt   DateTime @updatedAt       @db.Timestamptz
   @@unique([workspaceId, e164])
 }
 
@@ -39,8 +39,8 @@ model Agent {
   name               String
   elevenLabsAgentId  String
   defaultLocale      String?
-  createdAt          DateTime @default(now())
-  updatedAt          DateTime @updatedAt
+  createdAt          DateTime @default(now()) @db.Timestamptz
+  updatedAt          DateTime @updatedAt       @db.Timestamptz
   calls              Call[]
   callDailyAggregates CallDailyAggregate[]
 }
@@ -52,8 +52,8 @@ model Campaign {
   externalId   String?
   name         String?
   status       String   @default("active")
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
+  createdAt    DateTime @default(now()) @db.Timestamptz
+  updatedAt    DateTime @updatedAt       @db.Timestamptz
   calls        Call[]
 }
 
@@ -72,8 +72,8 @@ model Call {
   metadata     Json?
   externalRef  String? // e.g., ElevenLabs call id
   durationSeconds Int?
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
+  createdAt    DateTime @default(now()) @db.Timestamptz
+  updatedAt    DateTime @updatedAt       @db.Timestamptz
 
   @@index([workspaceId, createdAt])
   @@index([workspaceId, status, createdAt])
@@ -81,7 +81,7 @@ model Call {
 
 model CallDailyAggregate {
   id           String   @id @default(cuid())
-  date         DateTime
+  date         DateTime @db.Timestamptz
   workspace    Workspace @relation(fields: [workspaceId], references: [id])
   workspaceId  String
   agent        Agent     @relation(fields: [agentId], references: [id])
@@ -93,8 +93,8 @@ model CallDailyAggregate {
   failed       Int      @default(0)
   total        Int      @default(0)
 
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
+  createdAt    DateTime @default(now()) @db.Timestamptz
+  updatedAt    DateTime @updatedAt       @db.Timestamptz
 
   @@unique([date, workspaceId, agentId])
   @@index([workspaceId, date])
