@@ -3,9 +3,6 @@ import { registerCallsRoutes } from './routes/calls.routes.js';
 import { logger } from './lib/logger.js';
 import { env } from './lib/env.js';
 import { redis } from './lib/redis.js';
-import './queues/calls.worker.js';
-import './queues/maintenance.worker.js';
-import { scheduleDailyAggregationIfNeeded } from './queues/maintenance.queue.js';
 
 async function main() {
   const app = Fastify({ logger: true });
@@ -19,8 +16,15 @@ async function main() {
   // Do not force connect; BullMQ and ioredis will connect lazily when needed
   await app.listen({ port, host: '0.0.0.0' });
 
-  // Ensure daily maintenance job exists
-  await scheduleDailyAggregationIfNeeded();
+  // Optionally disable workers for local tests
+  if (process.env.DISABLE_WORKERS !== '1') {
+    await import('./queues/calls.worker.js');
+    await import('./queues/maintenance.worker.js');
+    const { scheduleDailyAggregationIfNeeded } = await import('./queues/maintenance.queue.js');
+    await scheduleDailyAggregationIfNeeded();
+  } else {
+    logger.info('Workers disabled by DISABLE_WORKERS=1');
+  }
 }
 
 main().catch((err) => {
