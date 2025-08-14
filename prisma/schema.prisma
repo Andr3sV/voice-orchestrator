@@ -8,94 +8,113 @@ datasource db {
 }
 
 model Workspace {
-  id           String   @id @default(cuid())
-  name         String
-  apiKey       String   @unique
-  createdAt    DateTime @default(now()) @db.Timestamptz
-  updatedAt    DateTime @updatedAt       @db.Timestamptz
-  phoneNumbers WorkspacePhoneNumber[]
-  agents       Agent[]
-  campaigns    Campaign[]
-  calls        Call[]
+  id                  String                 @id @default(cuid())
+  name                String
+  apiKey              String                 @unique
+  createdAt           DateTime               @default(now()) @db.Timestamptz(6)
+  updatedAt           DateTime               @updatedAt @db.Timestamptz(6)
+  agents              Agent[]
+  calls               Call[]
   callDailyAggregates CallDailyAggregate[]
+  campaigns           Campaign[]
+  phoneNumbers        WorkspacePhoneNumber[]
 }
 
 model WorkspacePhoneNumber {
-  id          String   @id @default(cuid())
-  workspace   Workspace @relation(fields: [workspaceId], references: [id])
+  id          String    @id @default(cuid())
   workspaceId String
   e164        String
   label       String?
-  active      Boolean  @default(true)
-  createdAt   DateTime @default(now()) @db.Timestamptz
-  updatedAt   DateTime @updatedAt       @db.Timestamptz
+  active      Boolean   @default(true)
+  createdAt   DateTime  @default(now()) @db.Timestamptz(6)
+  updatedAt   DateTime  @updatedAt @db.Timestamptz(6)
+  workspace   Workspace @relation(fields: [workspaceId], references: [id])
+  // Optional link to ElevenLabs phone number id (e.g., phnum_...)
+  elevenLabsPhoneNumberId String?
+  agentLinks AgentPhoneNumber[]
+
   @@unique([workspaceId, e164])
 }
 
 model Agent {
-  id                 String   @id @default(cuid())
-  workspace          Workspace @relation(fields: [workspaceId], references: [id])
-  workspaceId        String
-  name               String
-  elevenLabsAgentId  String
-  defaultLocale      String?
-  createdAt          DateTime @default(now()) @db.Timestamptz
-  updatedAt          DateTime @updatedAt       @db.Timestamptz
-  calls              Call[]
+  id                  String               @id @default(cuid())
+  workspaceId         String
+  name                String
+  elevenLabsAgentId   String
+  defaultLocale       String?
+  createdAt           DateTime             @default(now()) @db.Timestamptz(6)
+  updatedAt           DateTime             @updatedAt @db.Timestamptz(6)
+  workspace           Workspace            @relation(fields: [workspaceId], references: [id])
+  calls               Call[]
   callDailyAggregates CallDailyAggregate[]
+  phoneLinks          AgentPhoneNumber[]
 }
 
 model Campaign {
-  id           String   @id @default(cuid())
-  workspace    Workspace @relation(fields: [workspaceId], references: [id])
-  workspaceId  String
-  externalId   String?
-  name         String?
-  status       String   @default("active")
-  createdAt    DateTime @default(now()) @db.Timestamptz
-  updatedAt    DateTime @updatedAt       @db.Timestamptz
-  calls        Call[]
+  id          String    @id @default(cuid())
+  workspaceId String
+  externalId  String?
+  name        String?
+  status      String    @default("active")
+  createdAt   DateTime  @default(now()) @db.Timestamptz(6)
+  updatedAt   DateTime  @updatedAt @db.Timestamptz(6)
+  calls       Call[]
+  workspace   Workspace @relation(fields: [workspaceId], references: [id])
 }
 
 model Call {
-  id           String   @id @default(cuid())
-  workspace    Workspace @relation(fields: [workspaceId], references: [id])
-  workspaceId  String
-  agent        Agent     @relation(fields: [agentId], references: [id])
-  agentId      String
-  campaign     Campaign? @relation(fields: [campaignId], references: [id])
-  campaignId   String?
-  to           String
-  from         String
-  status       String   @default("queued")
-  priority     Int      @default(0)
-  metadata     Json?
-  externalRef  String? // e.g., ElevenLabs call id
+  id              String    @id @default(cuid())
+  workspaceId     String
+  agentId         String
+  campaignId      String?
+  to              String
+  from            String
+  status          String    @default("queued")
+  priority        Int       @default(0)
+  metadata        Json?
+  externalRef     String?
+  createdAt       DateTime  @default(now()) @db.Timestamptz(6)
+  updatedAt       DateTime  @updatedAt @db.Timestamptz(6)
   durationSeconds Int?
-  createdAt    DateTime @default(now()) @db.Timestamptz
-  updatedAt    DateTime @updatedAt       @db.Timestamptz
+  agent           Agent     @relation(fields: [agentId], references: [id])
+  campaign        Campaign? @relation(fields: [campaignId], references: [id])
+  workspace       Workspace @relation(fields: [workspaceId], references: [id])
 
   @@index([workspaceId, createdAt])
   @@index([workspaceId, status, createdAt])
 }
 
 model CallDailyAggregate {
-  id           String   @id @default(cuid())
-  date         DateTime @db.Timestamptz
-  workspace    Workspace @relation(fields: [workspaceId], references: [id])
-  workspaceId  String
-  agent        Agent     @relation(fields: [agentId], references: [id])
-  agentId      String
-
-  queued       Int      @default(0)
-  in_progress  Int      @default(0)
-  completed    Int      @default(0)
-  failed       Int      @default(0)
-  total        Int      @default(0)
-
-  createdAt    DateTime @default(now()) @db.Timestamptz
-  updatedAt    DateTime @updatedAt       @db.Timestamptz
+  id          String    @id @default(cuid())
+  date        DateTime  @db.Timestamptz(6)
+  workspaceId String
+  agentId     String
+  queued      Int       @default(0)
+  in_progress Int       @default(0)
+  completed   Int       @default(0)
+  failed      Int       @default(0)
+  total       Int       @default(0)
+  createdAt   DateTime  @default(now()) @db.Timestamptz(6)
+  updatedAt   DateTime  @updatedAt @db.Timestamptz(6)
+  agent       Agent     @relation(fields: [agentId], references: [id])
+  workspace   Workspace @relation(fields: [workspaceId], references: [id])
 
   @@unique([date, workspaceId, agentId])
   @@index([workspaceId, date])
+}
+
+model AgentPhoneNumber {
+  id             String               @id @default(cuid())
+  agentId        String
+  phoneNumberId  String
+  isDefault      Boolean              @default(false)
+  createdAt      DateTime             @default(now()) @db.Timestamptz(6)
+  updatedAt      DateTime             @updatedAt @db.Timestamptz(6)
+
+  agent          Agent                @relation(fields: [agentId], references: [id])
+  phoneNumber    WorkspacePhoneNumber @relation(fields: [phoneNumberId], references: [id])
+
+  @@unique([agentId, phoneNumberId])
+  @@index([agentId])
+  @@index([phoneNumberId])
 }

@@ -44,11 +44,20 @@ const createPrioritySchema = z.object({
   variables: z.record(z.string(), z.unknown()).optional() as unknown as z.ZodType<Record<string, unknown> | undefined>,
 });
 
+const bulkAgentEntrySchema = z.object({
+  agentId: z.string().min(1),
+  agentPhoneNumberId: z.string().optional(), // ElevenLabs phone id (phnum_...)
+  fromNumber: z.string().min(5).optional(),  // E.164 to record in Call.from
+});
+
 const createBulkSchema = z.object({
   workspaceId: z.string().min(1),
-  agentId: z.string().min(1),
+  // Legacy single-agent fields (still supported)
+  agentId: z.string().min(1).optional(),
   agentPhoneNumberId: z.string().optional(),
   fromNumber: z.string().min(5).optional(),
+  // New multi-agent distribution
+  agents: z.array(bulkAgentEntrySchema).optional(),
   campaignId: z.string().optional(),
   calls: z
     .array(
@@ -83,6 +92,48 @@ async function ensureWorkspaceAndAgent(workspaceId: string, agentId: string) {
       },
     });
   }
+}
+
+async function ensureWorkspaceAndAgents(workspaceId: string, agentIds: string[]) {
+  await prisma.workspace.upsert({
+    where: { id: workspaceId },
+    update: {},
+    create: { id: workspaceId, name: workspaceId, apiKey: `auto_${uuidv4()}` },
+  });
+  const uniqueIds = Array.from(new Set(agentIds));
+  const existing = await prisma.agent.findMany({ where: { id: { in: uniqueIds } }, select: { id: true } });
+  const existingSet = new Set(existing.map((a) => a.id));
+  const toCreate = uniqueIds.filter((id) => !existingSet.has(id));
+  if (toCreate.length > 0) {
+    await prisma.agent.createMany({
+      data: toCreate.map((id) => ({ id, workspaceId, name: id, elevenLabsAgentId: id })),
+      skipDuplicates: true,
+    });
+  }
+}
+
+async function resolveDefaultPhoneForAgent(workspaceId: string, agentId: string): Promise<{ agentPhoneNumberId: string; fromNumber: string } | null> {
+  // Find default mapping Agent -> WorkspacePhoneNumber with valid ElevenLabs id
+  const links = await prisma.agentPhoneNumber.findMany({
+    where: { agentId },
+    include: { phoneNumber: true },
+    orderBy: [{ isDefault: 'desc' }, { createdAt: 'asc' }],
+  });
+  for (const link of links) {
+    if (link.phoneNumber.workspaceId !== workspaceId) continue;
+    if (!link.phoneNumber.active) continue;
+    const elId = (link.phoneNumber as any).elevenLabsPhoneNumberId as string | null;
+    const e164 = link.phoneNumber.e164;
+    if (elId && e164) return { agentPhoneNumberId: elId, fromNumber: e164 };
+  }
+  // Fallback: pick any active workspace phone number with elevenLabsPhoneNumberId
+  const anyPhone = await prisma.workspacePhoneNumber.findFirst({
+    where: { workspaceId, active: true, elevenLabsPhoneNumberId: { not: null } as any },
+  });
+  if (anyPhone && anyPhone.elevenLabsPhoneNumberId) {
+    return { agentPhoneNumberId: anyPhone.elevenLabsPhoneNumberId, fromNumber: anyPhone.e164 } as any;
+  }
+  return null;
 }
 
 function withDefaultVariables(vars?: Record<string, unknown>): Record<string, unknown> {
@@ -146,6 +197,84 @@ export async function registerCallsRoutes(app: FastifyInstance) {
     await aggregateDailyFor(target);
     await purgeOldCalls();
     return reply.send({ ok: true, date: target });
+  });
+
+  // Manage workspace phone numbers (create/update)
+  app.post('/workspaces/phone-numbers', async (request, reply) => {
+    const ws = await authenticateWorkspace(request);
+    const schema = z.object({
+      workspaceId: z.string().min(1),
+      e164: z.string().min(5),
+      label: z.string().optional(),
+      active: z.boolean().optional(),
+      elevenLabsPhoneNumberId: z.string().optional(),
+    });
+    const body = schema.parse(request.body ?? {});
+    if (body.workspaceId !== ws.id) return reply.code(403).send({ error: 'Forbidden: workspaceId mismatch' });
+    const updateData: any = {};
+    if (body.label !== undefined) updateData.label = body.label;
+    if (body.active !== undefined) updateData.active = body.active;
+    if (body.elevenLabsPhoneNumberId !== undefined) updateData.elevenLabsPhoneNumberId = body.elevenLabsPhoneNumberId;
+    const rec = await prisma.workspacePhoneNumber.upsert({
+      where: { workspaceId_e164: { workspaceId: body.workspaceId, e164: body.e164 } },
+      update: updateData,
+      create: { workspaceId: body.workspaceId, e164: body.e164, label: body.label ?? null, active: body.active ?? true, elevenLabsPhoneNumberId: body.elevenLabsPhoneNumberId ?? null },
+    });
+    return reply.code(201).send({ id: rec.id, e164: rec.e164, elevenLabsPhoneNumberId: (rec as any).elevenLabsPhoneNumberId ?? null });
+  });
+
+  // List workspace phone numbers
+  app.get('/workspaces/:workspaceId/phone-numbers', async (request, reply) => {
+    const ws = await authenticateWorkspace(request);
+    const params = z.object({ workspaceId: z.string().min(1) }).parse(request.params);
+    if (params.workspaceId !== ws.id) return reply.code(403).send({ error: 'Forbidden: workspaceId mismatch' });
+    const rows = await prisma.workspacePhoneNumber.findMany({ where: { workspaceId: params.workspaceId }, orderBy: { createdAt: 'desc' } });
+    return reply.send(rows.map((r) => ({ id: r.id, e164: r.e164, active: r.active, label: r.label, elevenLabsPhoneNumberId: (r as any).elevenLabsPhoneNumberId ?? null })));
+  });
+
+  // Link agent to a workspace phone number (optionally mark as default)
+  app.post('/agents/phone-links', async (request, reply) => {
+    const ws = await authenticateWorkspace(request);
+    const schema = z.object({
+      workspaceId: z.string().min(1),
+      agentId: z.string().min(1),
+      phoneNumberId: z.string().optional(),
+      e164: z.string().min(5).optional(),
+      isDefault: z.boolean().optional(),
+    });
+    const body = schema.parse(request.body ?? {});
+    if (body.workspaceId !== ws.id) return reply.code(403).send({ error: 'Forbidden: workspaceId mismatch' });
+    if (!body.phoneNumberId && !body.e164) return reply.code(400).send({ error: 'Provide phoneNumberId or e164' });
+    const phone = body.phoneNumberId
+      ? await prisma.workspacePhoneNumber.findFirst({ where: { id: body.phoneNumberId, workspaceId: body.workspaceId } })
+      : await prisma.workspacePhoneNumber.findFirst({ where: { workspaceId: body.workspaceId, e164: body.e164! } });
+    if (!phone) return reply.code(404).send({ error: 'Phone number not found in workspace' });
+    await ensureWorkspaceAndAgent(body.workspaceId, body.agentId);
+    const updateLink: any = {};
+    if (body.isDefault !== undefined) updateLink.isDefault = body.isDefault;
+    const link = await prisma.agentPhoneNumber.upsert({
+      where: { agentId_phoneNumberId: { agentId: body.agentId, phoneNumberId: phone.id } },
+      update: updateLink,
+      create: { agentId: body.agentId, phoneNumberId: phone.id, isDefault: body.isDefault ?? false },
+    });
+    if (body.isDefault) {
+      // unset others for this agent
+      await prisma.agentPhoneNumber.updateMany({ where: { agentId: body.agentId, id: { not: link.id } }, data: { isDefault: false } });
+    }
+    return reply.code(201).send({ id: link.id, agentId: link.agentId, phoneNumberId: link.phoneNumberId, isDefault: link.isDefault });
+  });
+
+  // List agent phone links
+  app.get('/agents/:agentId/phone-links', async (request, reply) => {
+    const ws = await authenticateWorkspace(request);
+    const params = z.object({ agentId: z.string().min(1) }).parse(request.params);
+    const q = z.object({ workspaceId: z.string().min(1) }).parse(request.query);
+    if (q.workspaceId !== ws.id) return reply.code(403).send({ error: 'Forbidden: workspaceId mismatch' });
+    const links = await prisma.agentPhoneNumber.findMany({ where: { agentId: params.agentId }, include: { phoneNumber: true } });
+    const items = links
+      .filter((l) => l.phoneNumber.workspaceId === q.workspaceId)
+      .map((l) => ({ id: l.id, isDefault: l.isDefault, e164: l.phoneNumber.e164, phoneNumberId: l.phoneNumberId, elevenLabsPhoneNumberId: (l.phoneNumber as any).elevenLabsPhoneNumberId ?? null }));
+    return reply.send(items);
   });
 
   // List paginated calls
@@ -278,6 +407,10 @@ export async function registerCallsRoutes(app: FastifyInstance) {
       },
     });
 
+    if (process.env.DISABLE_WORKERS === '1') {
+      return reply.code(201).send({ created: true, callId: call.id, externalRef: null, note: 'Workers disabled: outbound skipped' });
+    }
+
     const result = await elevenLabsClient.createOutboundCall({
       workspaceId: body.workspaceId,
       agentId: body.agentId,
@@ -303,8 +436,45 @@ export async function registerCallsRoutes(app: FastifyInstance) {
     if (body.workspaceId !== ws.id) {
       return reply.code(403).send({ error: 'Forbidden: workspaceId mismatch' });
     }
-    await ensureWorkspaceAndAgent(body.workspaceId, body.agentId);
-    const jobs = body.calls.map((c) => {
+    // Determine agent list: new multi-agent mode or legacy single-agent mode
+    let agentsList: { agentId: string; agentPhoneNumberId?: string | undefined; fromNumber?: string | undefined }[] = [];
+    if (body.agents && body.agents.length > 0) {
+      agentsList = body.agents;
+      await ensureWorkspaceAndAgents(body.workspaceId, agentsList.map((a) => a.agentId));
+    } else if (body.agentId) {
+      agentsList = [{ agentId: body.agentId!, agentPhoneNumberId: body.agentPhoneNumberId, fromNumber: body.fromNumber }];
+      await ensureWorkspaceAndAgent(body.workspaceId, body.agentId);
+    } else {
+      return reply.code(400).send({ error: 'Provide either agentId or agents[]' });
+    }
+
+    // Resolve defaults where needed
+    const resolvedAgents: { agentId: string; agentPhoneNumberId: string; fromNumber: string }[] = [];
+    const missing: string[] = [];
+    for (const a of agentsList) {
+      if (a.agentPhoneNumberId && a.fromNumber) {
+        resolvedAgents.push({ agentId: a.agentId, agentPhoneNumberId: a.agentPhoneNumberId, fromNumber: a.fromNumber });
+        continue;
+      }
+      if (a.agentPhoneNumberId && !a.fromNumber) {
+        // Allow missing fromNumber for Twilio flow; we'll store empty from in Call
+        resolvedAgents.push({ agentId: a.agentId, agentPhoneNumberId: a.agentPhoneNumberId, fromNumber: '' });
+        continue;
+      }
+      const r = await resolveDefaultPhoneForAgent(body.workspaceId, a.agentId);
+      if (!r) missing.push(a.agentId);
+      else resolvedAgents.push({ agentId: a.agentId, agentPhoneNumberId: a.agentPhoneNumberId ?? r.agentPhoneNumberId, fromNumber: a.fromNumber ?? r.fromNumber });
+    }
+    if (missing.length > 0) {
+      return reply.code(400).send({ error: 'Missing phone mapping for agents', agents: missing });
+    }
+
+    // Distribute calls round-robin among resolved agents
+    if (resolvedAgents.length === 0) {
+      return reply.code(400).send({ error: 'No agents resolved' });
+    }
+    const jobs = body.calls.map((c, idx) => {
+      const a = resolvedAgents[idx % resolvedAgents.length]!;
       const payload: {
         workspaceId: string;
         agentId: string;
@@ -316,12 +486,12 @@ export async function registerCallsRoutes(app: FastifyInstance) {
         campaignId?: string;
       } = {
         workspaceId: body.workspaceId,
-        agentId: body.agentId,
-        fromNumber: body.fromNumber ?? '',
+        agentId: a.agentId,
+        agentPhoneNumberId: a.agentPhoneNumberId,
+        fromNumber: a.fromNumber,
         toNumber: c.toNumber,
         variables: withDefaultVariables(c.variables),
       };
-      if (body.agentPhoneNumberId) payload.agentPhoneNumberId = body.agentPhoneNumberId;
       if (c.metadata) payload.metadata = c.metadata;
       if (body.campaignId) payload.campaignId = body.campaignId;
       return { jobType: 'BULK' as const, payload };
@@ -340,8 +510,11 @@ export async function registerCallsRoutes(app: FastifyInstance) {
       })),
     });
 
+    if (process.env.DISABLE_WORKERS === '1') {
+      return reply.code(202).send({ enqueued: jobs.length, agents: resolvedAgents.map(a => ({ agentId: a.agentId, fromNumber: a.fromNumber })), note: 'Workers disabled: queue skipped' });
+    }
     const res = await addBulkCalls(jobs);
-    return reply.code(202).send({ enqueued: res.length });
+    return reply.code(202).send({ enqueued: res.length, agents: resolvedAgents.map(a => ({ agentId: a.agentId, fromNumber: a.fromNumber })) });
   });
 
   // Usage: total minutes/seconds by campaign
