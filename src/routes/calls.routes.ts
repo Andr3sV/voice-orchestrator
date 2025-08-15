@@ -1,4 +1,6 @@
 import type { FastifyInstance } from 'fastify';
+import twilio from 'twilio';
+import { env } from '../lib/env.js';
 import { z } from 'zod';
 import { addBulkCalls } from '../queues/calls.worker.js';
 import { elevenLabsClient } from '../lib/elevenlabs.js';
@@ -58,6 +60,7 @@ const createBulkSchema = z.object({
   fromNumber: z.string().min(5).optional(),
   // New multi-agent distribution
   agents: z.array(bulkAgentEntrySchema).optional(),
+  gateMode: z.enum(['twilio_amd_bridge', 'twilio_amd_handoff']).optional(),
   campaignId: z.string().optional(),
   calls: z
     .array(
@@ -162,6 +165,17 @@ const reportQuerySchema = z.object({
 });
 
 export async function registerCallsRoutes(app: FastifyInstance) {
+  // Parse x-www-form-urlencoded for Twilio webhooks
+  app.addContentTypeParser('application/x-www-form-urlencoded', { parseAs: 'string' }, (_req, payload, done) => {
+    try {
+      const params = new URLSearchParams((payload as string) || '');
+      const obj: Record<string, string> = {};
+      params.forEach((v, k) => { obj[k] = v; });
+      done(null, obj);
+    } catch (e) {
+      done(e as Error, undefined as any);
+    }
+  });
   // Admin: provision or fetch workspace API key
   app.post('/workspaces/provision', async (request, reply) => {
     requireAdmin(request);
@@ -186,6 +200,31 @@ export async function registerCallsRoutes(app: FastifyInstance) {
     if (!ws) return reply.code(404).send({ error: 'Not found' });
     const masked = ws.apiKey.length > 6 ? `${ws.apiKey.slice(0, 3)}***${ws.apiKey.slice(-3)}` : '***';
     return reply.send({ id: ws.id, name: ws.name, apiKeyMasked: masked });
+  });
+
+  // Create campaign (workspace-auth)
+  app.post('/campaigns', async (request, reply) => {
+    const ws = await authenticateWorkspace(request);
+    const schema = z.object({
+      workspaceId: z.string().min(1),
+      id: z.string().optional(),
+      externalId: z.string().optional(),
+      name: z.string().optional(),
+      status: z.string().optional(),
+    });
+    const body = schema.parse(request.body ?? {});
+    if (body.workspaceId !== ws.id) return reply.code(403).send({ error: 'Forbidden: workspaceId mismatch' });
+    const created = await prisma.campaign.create({
+      data: {
+        // Let DB generate id when undefined by omitting the field
+        ...(body.id ? { id: body.id } : {}),
+        workspaceId: body.workspaceId,
+        ...(body.externalId !== undefined ? { externalId: body.externalId } : {}),
+        ...(body.name !== undefined ? { name: body.name } : {}),
+        status: body.status ?? 'active',
+      },
+    });
+    return reply.code(201).send(created);
   });
 
   // Manual daily aggregate + purge endpoint
@@ -407,6 +446,23 @@ export async function registerCallsRoutes(app: FastifyInstance) {
       },
     });
 
+    const gateMode = (request.headers['x-gate-mode'] as string | undefined) ?? (request as any).body?.gateMode;
+    if (gateMode === 'twilio_amd_bridge' && env.TWILIO_ACCOUNT_SID && env.TWILIO_AUTH_TOKEN) {
+      const client = twilio(env.TWILIO_ACCOUNT_SID, env.TWILIO_AUTH_TOKEN);
+      const from = body.fromNumber ?? env.TWILIO_FROM_FALLBACK ?? '';
+      const amdCallback = `${env.PUBLIC_BASE_URL ?? ''}/webhooks/twilio/amd?callId=${encodeURIComponent(call.id)}&agentId=${encodeURIComponent(body.agentId)}`;
+      await client.calls.create({
+        to: body.toNumber,
+        from,
+        machineDetection: 'Enable',
+        machineDetectionTimeout: 4,
+        asyncAmd: 'true',
+        asyncAmdStatusCallback: amdCallback,
+        url: `${env.PUBLIC_BASE_URL ?? ''}/webhooks/twilio/answer`,
+      });
+      return reply.code(201).send({ created: true, callId: call.id, externalRef: null, mode: 'twilio_amd_bridge' });
+    }
+
     if (process.env.DISABLE_WORKERS === '1') {
       return reply.code(201).send({ created: true, callId: call.id, externalRef: null, note: 'Workers disabled: outbound skipped' });
     }
@@ -429,12 +485,60 @@ export async function registerCallsRoutes(app: FastifyInstance) {
     return reply.code(201).send({ created: true, callId: call.id, externalRef: result.callId });
   });
 
+  // Twilio: basic answer webhook (TwiML)
+  app.all('/webhooks/twilio/answer', async (_req, reply) => {
+    const VoiceResponse = twilio.twiml.VoiceResponse;
+    const twiml = new VoiceResponse();
+    twiml.pause({ length: 1 });
+    reply.header('Content-Type', 'text/xml');
+    return reply.send(twiml.toString());
+  });
+
+  // Twilio: AMD async callback
+  app.post('/webhooks/twilio/amd', async (request, reply) => {
+    const params = request.body as Record<string, string>;
+    const callId = (request.query as any)?.callId as string | undefined;
+    const agentId = (request.query as any)?.agentId as string | undefined;
+    const result = (params['AnsweredBy'] || '').toLowerCase();
+    if (!callId || !agentId) return reply.code(200).send('ok');
+    if (result.includes('human')) {
+      // fetch agent default phone mapping to dial ElevenLabs number
+      const link = await prisma.agentPhoneNumber.findFirst({
+        where: { agentId },
+        include: { phoneNumber: true },
+        orderBy: { isDefault: 'desc' },
+      });
+      const e164El = link?.phoneNumber?.e164;
+      if (e164El) {
+        const VoiceResponse = twilio.twiml.VoiceResponse;
+        const twiml = new VoiceResponse();
+        twiml.dial({}, e164El);
+        reply.header('Content-Type', 'text/xml');
+        return reply.send(twiml.toString());
+      }
+    }
+    // machine or no mapping: hangup
+    const VoiceResponse = twilio.twiml.VoiceResponse;
+    const twiml = new VoiceResponse();
+    twiml.hangup();
+    reply.header('Content-Type', 'text/xml');
+    return reply.send(twiml.toString());
+  });
+
   // Bulk create (queued)
   app.post('/calls/bulk', async (request, reply) => {
     const ws = await authenticateWorkspace(request);
     const body = createBulkSchema.parse(request.body);
     if (body.workspaceId !== ws.id) {
       return reply.code(403).send({ error: 'Forbidden: workspaceId mismatch' });
+    }
+    // Ensure campaign exists if provided
+    if (body.campaignId) {
+      await prisma.campaign.upsert({
+        where: { id: body.campaignId },
+        update: {},
+        create: { id: body.campaignId, workspaceId: body.workspaceId, name: body.campaignId, status: 'active' },
+      });
     }
     // Determine agent list: new multi-agent mode or legacy single-agent mode
     let agentsList: { agentId: string; agentPhoneNumberId?: string | undefined; fromNumber?: string | undefined }[] = [];
@@ -484,6 +588,7 @@ export async function registerCallsRoutes(app: FastifyInstance) {
         metadata?: Record<string, unknown>;
         variables: Record<string, unknown>;
         campaignId?: string;
+        gateMode?: 'twilio_amd_bridge' | 'twilio_amd_handoff';
       } = {
         workspaceId: body.workspaceId,
         agentId: a.agentId,
@@ -494,6 +599,7 @@ export async function registerCallsRoutes(app: FastifyInstance) {
       };
       if (c.metadata) payload.metadata = c.metadata;
       if (body.campaignId) payload.campaignId = body.campaignId;
+      if (body.gateMode) payload.gateMode = body.gateMode;
       return { jobType: 'BULK' as const, payload };
     });
 
