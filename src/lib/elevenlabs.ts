@@ -31,14 +31,16 @@ export class ElevenLabsClient {
       },
       timeout: 30_000,
     });
-    this.outboundCallsPath = env.ELEVENLABS_OUTBOUND_CALLS_PATH ?? '/v1/voice/agents/{agentId}/calls';
+    this.outboundCallsPath = env.ELEVENLABS_OUTBOUND_CALLS_PATH ?? '/v1/convai/sip-trunk/outbound-call';
   }
 
   async createOutboundCall(payload: OutboundCallPayload): Promise<OutboundCallResponse> {
     const sanitize = (s: string) => s.replace(/\s+/g, '');
-    const useTwilio = this.outboundCallsPath.includes('/convai/twilio/outbound-call') || !!payload.agentPhoneNumberId;
+    
+    // Use Twilio native integration only if explicitly configured
+    const useTwilioNative = this.outboundCallsPath.includes('/convai/twilio/outbound-call');
 
-    if (useTwilio) {
+    if (useTwilioNative) {
       const twilioHttp = axios.create({
         baseURL: env.ELEVENLABS_BASE_URL,
         headers: {
@@ -55,27 +57,58 @@ export class ElevenLabsClient {
       if (payload.variables && Object.keys(payload.variables).length > 0) {
         body.conversation_initiation_client_data = { dynamic_variables: payload.variables };
       }
-      const { data } = await twilioHttp.post(this.outboundCallsPath, body);
-      return {
-        callId: data.callSid ?? data.conversation_id ?? 'unknown',
-        status: data.success === true ? 'queued' : 'failed',
-      };
+      try {
+        const { data } = await twilioHttp.post(this.outboundCallsPath, body);
+        return {
+          callId: data.callSid ?? data.conversation_id ?? 'unknown',
+          status: data.success === true ? 'queued' : 'failed',
+        };
+      } catch (err: any) {
+        const status = err?.response?.status;
+        const data = err?.response?.data;
+        const msg = `ElevenLabs Twilio outbound error${status ? ` (${status})` : ''}: ${typeof data === 'string' ? data : JSON.stringify(data)}`;
+        throw Object.assign(new Error(msg), { statusCode: status ?? 500 });
+      }
     }
 
-    const path = this.outboundCallsPath.replace('{agentId}', payload.agentId);
+    // SIP trunk endpoint requires xi-api-key header and specific payload structure
+    const sipTrunkHttp = axios.create({
+      baseURL: env.ELEVENLABS_BASE_URL,
+      headers: {
+        'Content-Type': 'application/json',
+        'xi-api-key': env.ELEVENLABS_API_KEY,
+      },
+      timeout: 30_000,
+    });
+
+    const path = this.outboundCallsPath;
+    // SIP trunk endpoint requires agent_phone_number_id
+    if (!payload.agentPhoneNumberId) {
+      throw Object.assign(new Error('SIP trunk outbound call requires agentPhoneNumberId'), { statusCode: 400 });
+    }
+
     const body: Record<string, unknown> = {
-      from_number: payload.fromNumber ? sanitize(payload.fromNumber) : undefined,
+      agent_id: payload.agentId,
+      agent_phone_number_id: payload.agentPhoneNumberId,
       to_number: sanitize(payload.toNumber),
     };
-    if (payload.metadata) body.metadata = payload.metadata;
-    if (payload.variables) body.variables = payload.variables;
-    if (payload.scheduleAtIso) body.schedule_at = payload.scheduleAtIso;
+    
+    if (payload.variables && Object.keys(payload.variables).length > 0) {
+      body.conversation_initiation_client_data = { dynamic_variables: payload.variables };
+    }
 
-    const { data } = await this.http.post(path, body);
-    return {
-      callId: data.id ?? data.call_id ?? data.callId ?? 'unknown',
-      status: data.status ?? 'queued',
-    };
+    try {
+      const { data } = await sipTrunkHttp.post(path, body);
+      return {
+        callId: data.conversation_id ?? data.sip_call_id ?? 'unknown',
+        status: data.success === true ? 'queued' : 'failed',
+      };
+    } catch (err: any) {
+      const status = err?.response?.status;
+      const data = err?.response?.data;
+      const msg = `ElevenLabs SIP trunk outbound error${status ? ` (${status})` : ''}: ${typeof data === 'string' ? data : JSON.stringify(data)}`;
+      throw Object.assign(new Error(msg), { statusCode: status ?? 500 });
+    }
   }
 }
 
