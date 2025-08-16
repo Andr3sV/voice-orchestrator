@@ -447,22 +447,27 @@ export async function registerCallsRoutes(app: FastifyInstance) {
     });
 
     const gateMode = (request.headers['x-gate-mode'] as string | undefined) ?? (request as any).body?.gateMode;
-    if (gateMode === 'twilio_amd_bridge' && env.TWILIO_ACCOUNT_SID && env.TWILIO_AUTH_TOKEN) {
-      const client = twilio(env.TWILIO_ACCOUNT_SID, env.TWILIO_AUTH_TOKEN);
-      const from = body.fromNumber ?? env.TWILIO_FROM_FALLBACK ?? '';
-      const amdCallback = `${env.PUBLIC_BASE_URL ?? ''}/webhooks/twilio/amd?callId=${encodeURIComponent(call.id)}&agentId=${encodeURIComponent(body.agentId)}`;
-      await client.calls.create({
-        to: body.toNumber,
-        from,
-        machineDetection: 'Enable',
-        machineDetectionTimeout: 4,
-        asyncAmd: 'true',
-        asyncAmdStatusCallback: amdCallback,
-        url: `${env.PUBLIC_BASE_URL ?? ''}/webhooks/twilio/answer`,
+    // For AMD bridge, send to worker; otherwise process directly
+    if (gateMode === 'twilio_amd_bridge') {
+      // Send to worker for AMD bridge processing
+      const { addPriorityCall } = await import('../queues/calls.worker.js');
+      await addPriorityCall({
+        jobType: 'PRIORITY',
+        payload: {
+          workspaceId: body.workspaceId,
+          agentId: body.agentId,
+          ...(body.agentPhoneNumberId ? { agentPhoneNumberId: body.agentPhoneNumberId } : {}),
+          fromNumber: body.fromNumber ?? '',
+          toNumber: body.toNumber,
+          ...(body.metadata ? { metadata: body.metadata } : {}),
+          variables: withDefaultVariables(body.variables),
+
+        },
       });
       return reply.code(201).send({ created: true, callId: call.id, externalRef: null, mode: 'twilio_amd_bridge' });
     }
 
+    // Process direct calls normally
     if (process.env.DISABLE_WORKERS === '1') {
       return reply.code(201).send({ created: true, callId: call.id, externalRef: null, note: 'Workers disabled: outbound skipped' });
     }
@@ -502,17 +507,22 @@ export async function registerCallsRoutes(app: FastifyInstance) {
     const result = (params['AnsweredBy'] || '').toLowerCase();
     if (!callId || !agentId) return reply.code(200).send('ok');
     if (result.includes('human')) {
-      // fetch agent default phone mapping to dial ElevenLabs number
-      const link = await prisma.agentPhoneNumber.findFirst({
-        where: { agentId },
-        include: { phoneNumber: true },
-        orderBy: { isDefault: 'desc' },
+      // For AMD bridge, we already created the ElevenLabs call, just connect it
+      // The callId here is the job ID, we need to find the actual call record
+      const call = await prisma.call.findFirst({
+        where: { 
+          workspaceId: '1', // TODO: make this dynamic
+          agentId,
+          status: 'queued'
+        },
+        orderBy: { createdAt: 'desc' }
       });
-      const e164El = link?.phoneNumber?.e164;
-      if (e164El) {
+      
+      if (call && call.externalRef) {
+        // Call was already created via ElevenLabs SIP trunk, just connect
         const VoiceResponse = twilio.twiml.VoiceResponse;
         const twiml = new VoiceResponse();
-        twiml.dial({}, e164El);
+        twiml.dial({}, '+34881556005'); // Connect to sales person
         reply.header('Content-Type', 'text/xml');
         return reply.send(twiml.toString());
       }

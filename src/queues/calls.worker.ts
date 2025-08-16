@@ -17,10 +17,26 @@ export const callsWorker = new Worker<CreateCallJob>(
     const { payload, jobType } = job.data;
     // Support gateMode Twilio AMD bridge for bulk
     const gateMode = (job.data?.payload as any)?.gateMode as 'twilio_amd_bridge' | undefined;
+    console.log('Worker processing job with gateMode:', gateMode, 'payload:', JSON.stringify(job.data?.payload));
     if (gateMode === 'twilio_amd_bridge' && env.TWILIO_ACCOUNT_SID && env.TWILIO_AUTH_TOKEN) {
+      // For AMD bridge, we need to use SIP trunk to get proper Caller ID presentation
+      // Use ElevenLabs SIP trunk for the actual call, Twilio only for AMD detection
       const client = twilio(env.TWILIO_ACCOUNT_SID, env.TWILIO_AUTH_TOKEN);
       const from = (job.data.payload as any).fromNumber;
-      const amdCallback = `${env.PUBLIC_BASE_URL ?? ''}/webhooks/twilio/amd?agentId=${encodeURIComponent(job.data.payload.agentId)}`;
+      const amdCallback = `${env.PUBLIC_BASE_URL ?? ''}/webhooks/twilio/amd?callId=${encodeURIComponent(job.id ?? 'unknown')}&agentId=${encodeURIComponent(job.data.payload.agentId)}`;
+      
+      // Create call via ElevenLabs SIP trunk first
+      const elevenLabsResult = await elevenLabsClient.createOutboundCall({
+        workspaceId: payload.workspaceId,
+        agentId: payload.agentId,
+        agentPhoneNumberId: (payload as any).agentPhoneNumberId,
+        fromNumber: payload.fromNumber,
+        toNumber: payload.toNumber,
+        metadata: payload.metadata,
+        variables: (payload as any).variables,
+      });
+      
+      // Then use Twilio for AMD detection
       await client.calls.create({
         to: job.data.payload.toNumber,
         from,
@@ -30,8 +46,9 @@ export const callsWorker = new Worker<CreateCallJob>(
         asyncAmdStatusCallback: amdCallback,
         url: `${env.PUBLIC_BASE_URL ?? ''}/webhooks/twilio/answer`,
       });
-      logger.info({ jobId: job.id, jobType, mode: 'twilio_amd_bridge' }, 'Twilio AMD call created');
-      return { callId: 'twilio-bridge', status: 'queued' as const };
+      
+      logger.info({ jobId: job.id, jobType, mode: 'twilio_amd_bridge', elevenLabsCallId: elevenLabsResult.callId }, 'Twilio AMD bridge call created');
+      return { callId: elevenLabsResult.callId, status: elevenLabsResult.status };
     }
 
     const result = await elevenLabsClient.createOutboundCall({
