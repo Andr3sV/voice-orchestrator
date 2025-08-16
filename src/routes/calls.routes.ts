@@ -44,6 +44,10 @@ const createPrioritySchema = z.object({
   toNumber: z.string().min(5),
   metadata: z.record(z.string(), z.unknown()).optional() as unknown as z.ZodType<Record<string, unknown> | undefined>,
   variables: z.record(z.string(), z.unknown()).optional() as unknown as z.ZodType<Record<string, unknown> | undefined>,
+  // AMD personalization options
+  machineDetectionTimeout: z.number().min(1).max(30).optional(),
+  enableMachineDetection: z.boolean().optional(),
+  concurrency: z.number().min(1).max(100).optional(),
 });
 
 const bulkAgentEntrySchema = z.object({
@@ -62,6 +66,10 @@ const createBulkSchema = z.object({
   agents: z.array(bulkAgentEntrySchema).optional(),
   gateMode: z.enum(['twilio_amd_bridge', 'twilio_amd_handoff']).optional(),
   campaignId: z.string().optional(),
+  // AMD personalization options
+  machineDetectionTimeout: z.number().min(1).max(30).optional(),
+  enableMachineDetection: z.boolean().optional(),
+  concurrency: z.number().min(1).max(100).optional(),
   calls: z
     .array(
       z.object({
@@ -461,7 +469,10 @@ export async function registerCallsRoutes(app: FastifyInstance) {
           toNumber: body.toNumber,
           ...(body.metadata ? { metadata: body.metadata } : {}),
           variables: withDefaultVariables(body.variables),
-
+          // Pass AMD personalization options
+          ...(body.machineDetectionTimeout ? { machineDetectionTimeout: body.machineDetectionTimeout } : {}),
+          ...(body.enableMachineDetection !== undefined ? { enableMachineDetection: body.enableMachineDetection } : {}),
+          ...(body.concurrency ? { concurrency: body.concurrency } : {}),
         },
       });
       return reply.code(201).send({ created: true, callId: call.id, externalRef: null, mode: 'twilio_amd_bridge' });

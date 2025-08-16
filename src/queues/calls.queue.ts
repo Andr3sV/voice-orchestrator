@@ -12,6 +12,10 @@ export type CreateCallJob = {
     toNumber: string;
     metadata?: Record<string, unknown>;
     variables?: Record<string, unknown>;
+    // AMD personalization options
+    machineDetectionTimeout?: number;
+    enableMachineDetection?: boolean;
+    concurrency?: number;
   };
 };
 

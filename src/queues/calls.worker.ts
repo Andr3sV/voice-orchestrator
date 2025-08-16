@@ -9,11 +9,17 @@ import { env } from '../lib/env.js';
 
 type CreateCallJob = import('./calls.queue.js').CreateCallJob;
 
-const concurrency = Number(process.env.CALLS_WORKER_CONCURRENCY ?? '50');
+const defaultConcurrency = Number(process.env.CALLS_WORKER_CONCURRENCY ?? '50');
 
 export const callsWorker = new Worker<CreateCallJob>(
   'calls-create',
   async (job) => {
+    // Apply personalized concurrency if specified
+    const jobConcurrency = (job.data.payload as any)?.concurrency ?? defaultConcurrency;
+    if (jobConcurrency !== defaultConcurrency) {
+      // Note: This is a per-job setting, the worker concurrency is still global
+      // For true per-job concurrency control, we'd need to implement job-specific workers
+    }
     const { payload, jobType } = job.data;
     // Support gateMode Twilio AMD bridge for bulk
     const gateMode = (job.data?.payload as any)?.gateMode as 'twilio_amd_bridge' | undefined;
@@ -36,15 +42,25 @@ export const callsWorker = new Worker<CreateCallJob>(
         variables: (payload as any).variables,
       });
       
-      // Then use Twilio for AMD detection
+      // Then use Twilio for AMD detection with personalized options
+      const amdOptions: any = {};
+      
+      // Apply personalized AMD settings
+      if (payload.enableMachineDetection !== false) { // Default to true if not specified
+        amdOptions.machineDetection = 'Enable';
+        amdOptions.machineDetectionTimeout = payload.machineDetectionTimeout ?? 6; // Default 6 seconds
+        amdOptions.asyncAmd = 'true';
+        amdOptions.asyncAmdStatusCallback = amdCallback;
+        amdOptions.url = `${env.PUBLIC_BASE_URL ?? ''}/webhooks/twilio/answer`;
+      } else {
+        // If AMD is disabled, just connect the call directly
+        amdOptions.url = `${env.PUBLIC_BASE_URL ?? ''}/webhooks/twilio/answer`;
+      }
+      
       await client.calls.create({
         to: job.data.payload.toNumber,
         from,
-        machineDetection: 'Enable',
-        machineDetectionTimeout: 4,
-        asyncAmd: 'true',
-        asyncAmdStatusCallback: amdCallback,
-        url: `${env.PUBLIC_BASE_URL ?? ''}/webhooks/twilio/answer`,
+        ...amdOptions,
       });
       
       logger.info({ jobId: job.id, jobType, mode: 'twilio_amd_bridge', elevenLabsCallId: elevenLabsResult.callId }, 'Twilio AMD bridge call created');
@@ -79,7 +95,7 @@ export const callsWorker = new Worker<CreateCallJob>(
   },
   {
     connection: redis,
-    concurrency,
+    concurrency: defaultConcurrency,
   }
 );
 
