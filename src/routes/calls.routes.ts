@@ -7,6 +7,8 @@ import { elevenLabsClient } from '../lib/elevenlabs.js';
 import { prisma } from '../lib/prisma.js';
 import { v4 as uuidv4 } from 'uuid';
 import { aggregateDailyFor, purgeOldCalls } from '../queues/calls.worker.js';
+import { metricsService } from '../lib/metrics.service.js';
+import { logger } from '../lib/logger.js';
 
 // Simple API key auth per workspace
 async function authenticateWorkspace(request: any) {
@@ -42,6 +44,7 @@ const createPrioritySchema = z.object({
   agentPhoneNumberId: z.string().optional(),
   fromNumber: z.string().min(5).optional(),
   toNumber: z.string().min(5),
+  campaignId: z.string().min(1).optional(),
   metadata: z.record(z.string(), z.unknown()).optional() as unknown as z.ZodType<Record<string, unknown> | undefined>,
   variables: z.record(z.string(), z.unknown()).optional() as unknown as z.ZodType<Record<string, unknown> | undefined>,
   // AMD personalization options
@@ -442,10 +445,20 @@ export async function registerCallsRoutes(app: FastifyInstance) {
       return reply.code(403).send({ error: 'Forbidden: workspaceId mismatch' });
     }
     await ensureWorkspaceAndAgent(body.workspaceId, body.agentId);
+    // Ensure campaign exists if provided
+    if (body.campaignId) {
+      await prisma.campaign.upsert({
+        where: { id: body.campaignId },
+        update: {},
+        create: { id: body.campaignId, workspaceId: body.workspaceId, name: body.campaignId, status: 'active' },
+      });
+    }
+
     const call = await prisma.call.create({
       data: {
         workspaceId: body.workspaceId,
         agentId: body.agentId,
+        campaignId: body.campaignId ?? null,
         to: body.toNumber,
         from: body.fromNumber ?? '',
         status: 'queued',
@@ -467,6 +480,7 @@ export async function registerCallsRoutes(app: FastifyInstance) {
           ...(body.agentPhoneNumberId ? { agentPhoneNumberId: body.agentPhoneNumberId } : {}),
           fromNumber: body.fromNumber ?? '',
           toNumber: body.toNumber,
+          ...(body.campaignId ? { campaignId: body.campaignId } : {}),
           ...(body.metadata ? { metadata: body.metadata } : {}),
           variables: withDefaultVariables(body.variables),
           // Pass AMD personalization options
@@ -516,28 +530,57 @@ export async function registerCallsRoutes(app: FastifyInstance) {
     const callId = (request.query as any)?.callId as string | undefined;
     const agentId = (request.query as any)?.agentId as string | undefined;
     const result = (params['AnsweredBy'] || '').toLowerCase();
+    const amdStatus = result.includes('human') ? 'human' : 'machine';
+    const amdConfidence = params['AmdConfidence'] ? parseFloat(params['AmdConfidence']) : null;
+    
+    logger.info({ callId, agentId, amdStatus, amdConfidence }, 'AMD callback received');
+
     if (!callId || !agentId) return reply.code(200).send('ok');
-    if (result.includes('human')) {
-      // For AMD bridge, we already created the ElevenLabs call, just connect it
-      // The callId here is the job ID, we need to find the actual call record
-      const call = await prisma.call.findFirst({
+
+    try {
+      // Update call record with AMD metrics
+      await prisma.call.updateMany({
         where: { 
           workspaceId: '1', // TODO: make this dynamic
           agentId,
           status: 'queued'
         },
-        orderBy: { createdAt: 'desc' }
+        data: {
+          amdStatus: amdStatus,
+          amdConfidence: amdConfidence,
+          amdDetectionTime: 4, // Default detection time
+          twilioCallSid: params['CallSid'] || null,
+          // Initialize cost tracking
+          costTwilio: 0.025, // Estimated Twilio AMD cost per call
+          costElevenLabs: null, // Will be updated when call completes
+        },
       });
-      
-      if (call && call.externalRef) {
-        // Call was already created via ElevenLabs SIP trunk, just connect
-        const VoiceResponse = twilio.twiml.VoiceResponse;
-        const twiml = new VoiceResponse();
-        twiml.dial({}, '+34881556005'); // Connect to sales person
-        reply.header('Content-Type', 'text/xml');
-        return reply.send(twiml.toString());
+
+      if (amdStatus === 'human') {
+        // For AMD bridge, we already created the ElevenLabs call, just connect it
+        // The callId here is the job ID, we need to find the actual call record
+        const call = await prisma.call.findFirst({
+          where: { 
+            workspaceId: '1', // TODO: make this dynamic
+            agentId,
+            status: 'queued'
+          },
+          orderBy: { createdAt: 'desc' }
+        });
+        
+        if (call && call.externalRef) {
+          // Call was already created via ElevenLabs SIP trunk, just connect
+          const VoiceResponse = twilio.twiml.VoiceResponse;
+          const twiml = new VoiceResponse();
+          twiml.dial({}, '+34881556005'); // Connect to sales person
+          reply.header('Content-Type', 'text/xml');
+          return reply.send(twiml.toString());
+        }
       }
+    } catch (error) {
+      logger.error({ error, callId, agentId }, 'Failed to update AMD metrics');
     }
+
     // machine or no mapping: hangup
     const VoiceResponse = twilio.twiml.VoiceResponse;
     const twiml = new VoiceResponse();
@@ -668,6 +711,136 @@ export async function registerCallsRoutes(app: FastifyInstance) {
     const completed = rows.filter((r) => r.status === 'completed').length;
     const failed = rows.filter((r) => r.status === 'failed').length;
     return reply.send({ totalSeconds, totalMinutes: Math.round(totalSeconds / 60), completed, failed });
+  });
+
+  // ===== NEW ADVANCED METRICS ENDPOINTS =====
+
+  // AMD Statistics by workspace or campaign
+  app.get('/calls/amd-stats', async (request, reply) => {
+    const ws = await authenticateWorkspace(request);
+    const schema = z.object({
+      workspaceId: z.string().min(1),
+      campaignId: z.string().min(1).optional(),
+      from: z.string().datetime(),
+      to: z.string().datetime(),
+    });
+    const q = schema.parse(request.query);
+    if (q.workspaceId !== ws.id) return reply.code(403).send({ error: 'Forbidden: workspaceId mismatch' });
+
+    try {
+      const stats = await metricsService.getAMDStats({
+        workspaceId: q.workspaceId,
+        ...(q.campaignId ? { campaignId: q.campaignId } : {}),
+        from: new Date(q.from),
+        to: new Date(q.to),
+      });
+      return reply.send(stats);
+    } catch (error) {
+      logger.error({ error }, 'Failed to get AMD stats');
+      return reply.code(500).send({ error: 'Failed to get AMD stats' });
+    }
+  });
+
+  // Cost Analysis by workspace or campaign
+  app.get('/calls/cost-analysis', async (request, reply) => {
+    const ws = await authenticateWorkspace(request);
+    const schema = z.object({
+      workspaceId: z.string().min(1),
+      campaignId: z.string().min(1).optional(),
+      from: z.string().datetime(),
+      to: z.string().datetime(),
+    });
+    const q = schema.parse(request.query);
+    if (q.workspaceId !== ws.id) return reply.code(403).send({ error: 'Forbidden: workspaceId mismatch' });
+
+    try {
+      const costs = await metricsService.getCostMetrics({
+        workspaceId: q.workspaceId,
+        ...(q.campaignId ? { campaignId: q.campaignId } : {}),
+        from: new Date(q.from),
+        to: new Date(q.to),
+      });
+      return reply.send(costs);
+    } catch (error) {
+      logger.error({ error }, 'Failed to get cost analysis');
+      return reply.code(500).send({ error: 'Failed to get cost analysis' });
+    }
+  });
+
+  // Quality Metrics by workspace or campaign
+  app.get('/calls/quality-metrics', async (request, reply) => {
+    const ws = await authenticateWorkspace(request);
+    const schema = z.object({
+      workspaceId: z.string().min(1),
+      campaignId: z.string().min(1).optional(),
+      from: z.string().datetime(),
+      to: z.string().datetime(),
+    });
+    const q = schema.parse(request.query);
+    if (q.workspaceId !== ws.id) return reply.code(403).send({ error: 'Forbidden: workspaceId mismatch' });
+
+    try {
+      const quality = await metricsService.getQualityMetrics({
+        workspaceId: q.workspaceId,
+        ...(q.campaignId ? { campaignId: q.campaignId } : {}),
+        from: new Date(q.from),
+        to: new Date(q.to),
+      });
+      return reply.send(quality);
+    } catch (error) {
+      logger.error({ error }, 'Failed to get quality metrics');
+      return reply.code(500).send({ error: 'Failed to get quality metrics' });
+    }
+  });
+
+  // Comprehensive Campaign Dashboard
+  app.get('/calls/campaign-dashboard', async (request, reply) => {
+    const ws = await authenticateWorkspace(request);
+    const schema = z.object({
+      workspaceId: z.string().min(1),
+      campaignId: z.string().min(1),
+      from: z.string().datetime(),
+      to: z.string().datetime(),
+    });
+    const q = schema.parse(request.query);
+    if (q.workspaceId !== ws.id) return reply.code(403).send({ error: 'Forbidden: workspaceId mismatch' });
+
+    try {
+      const dashboard = await metricsService.getCampaignDashboard({
+        workspaceId: q.workspaceId,
+        campaignId: q.campaignId,
+        from: new Date(q.from),
+        to: new Date(q.to),
+      });
+      return reply.send(dashboard);
+    } catch (error) {
+      logger.error({ error }, 'Failed to get campaign dashboard');
+      return reply.code(500).send({ error: 'Failed to get campaign dashboard' });
+    }
+  });
+
+  // Workspace Overview Dashboard
+  app.get('/calls/workspace-overview', async (request, reply) => {
+    const ws = await authenticateWorkspace(request);
+    const schema = z.object({
+      workspaceId: z.string().min(1),
+      from: z.string().datetime(),
+      to: z.string().datetime(),
+    });
+    const q = schema.parse(request.query);
+    if (q.workspaceId !== ws.id) return reply.code(403).send({ error: 'Forbidden: workspaceId mismatch' });
+
+    try {
+      const overview = await metricsService.getWorkspaceOverview({
+        workspaceId: q.workspaceId,
+        from: new Date(q.from),
+        to: new Date(q.to),
+      });
+      return reply.send(overview);
+    } catch (error) {
+      logger.error({ error }, 'Failed to get workspace overview');
+      return reply.code(500).send({ error: 'Failed to get workspace overview' });
+    }
   });
 }
 

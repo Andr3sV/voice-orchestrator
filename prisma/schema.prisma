@@ -18,6 +18,7 @@ model Workspace {
   callDailyAggregates CallDailyAggregate[]
   campaigns           Campaign[]
   phoneNumbers        WorkspacePhoneNumber[]
+  campaignDailyAggregates CampaignDailyAggregate[]
 }
 
 model WorkspacePhoneNumber {
@@ -60,6 +61,7 @@ model Campaign {
   updatedAt   DateTime  @updatedAt @db.Timestamptz(6)
   calls       Call[]
   workspace   Workspace @relation(fields: [workspaceId], references: [id])
+  campaignDailyAggregates CampaignDailyAggregate[]
 }
 
 model Call {
@@ -76,12 +78,38 @@ model Call {
   createdAt       DateTime  @default(now()) @db.Timestamptz(6)
   updatedAt       DateTime  @updatedAt @db.Timestamptz(6)
   durationSeconds Int?
+  
+  // AMD (Machine Detection) Metrics
+  amdStatus       String?              // human, machine, unknown
+  amdConfidence   Float?               // 0-100 confidence score
+  amdDetectionTime Int?                // seconds until detection
+  
+  // Twilio Integration
+  twilioCallSid   String?              // Twilio Call SID for detailed metrics
+  
+  // Call Quality Metrics
+  callQuality     String?              // excellent, good, fair, poor
+  jitter          Float?               // jitter in milliseconds
+  packetLoss      Float?               // packet loss percentage
+  mosScore        Float?               // Mean Opinion Score 1-5
+  
+  // Cost Metrics
+  costTwilio      Float?               // Twilio cost (AMD detection)
+  costElevenLabs  Float?               // ElevenLabs cost (conversation)
+  costBreakdown   Json?                // Detailed cost breakdown
+  
+  // Agent and SIP Details
+  agentModel      String?              // ElevenLabs agent model used
+  sipTrunkUsed    String?              // SIP trunk identifier
+  
   agent           Agent     @relation(fields: [agentId], references: [id])
   campaign        Campaign? @relation(fields: [campaignId], references: [id])
   workspace       Workspace @relation(fields: [workspaceId], references: [id])
 
   @@index([workspaceId, createdAt])
   @@index([workspaceId, status, createdAt])
+  @@index([workspaceId, campaignId, createdAt])
+  @@index([workspaceId, amdStatus, createdAt])
 }
 
 model CallDailyAggregate {
@@ -94,12 +122,59 @@ model CallDailyAggregate {
   completed   Int       @default(0)
   failed      Int       @default(0)
   total       Int       @default(0)
+  
+  // NUEVOS CAMPOS PARA MÉTRICAS AGREGADAS
+  // AMD (Machine Detection) Stats
+  amdStats    Json?     // { human: 10, machine: 5, unknown: 2, totalDetected: 17, detectionRate: 0.85 }
+  
+  // Cost Metrics
+  costMetrics Json?     // { twilio: 2.50, elevenLabs: 15.00, total: 17.50, costPerMinute: 0.35, costPerCall: 0.58 }
+  
+  // Quality Metrics
+  qualityMetrics Json?  // { averageMOS: 4.2, excellent: 8, good: 5, fair: 2, poor: 1, totalRated: 16 }
+  
+  // Duration and Volume
+  totalMinutes Int      @default(0)  // Total duration in seconds
+  totalCallsWithDuration Int @default(0) // Count of calls that have duration
+  
   createdAt   DateTime  @default(now()) @db.Timestamptz(6)
   updatedAt   DateTime  @updatedAt @db.Timestamptz(6)
   agent       Agent     @relation(fields: [agentId], references: [id])
   workspace   Workspace @relation(fields: [workspaceId], references: [id])
 
   @@unique([date, workspaceId, agentId])
+  @@index([workspaceId, date])
+}
+
+model CampaignDailyAggregate {
+  id          String    @id @default(cuid())
+  date        DateTime  @db.Timestamptz(6)
+  workspaceId String
+  campaignId  String
+  totalCalls  Int       @default(0)
+  totalMinutes Int      @default(0)
+  
+  // AMD (Machine Detection) Stats por Campaña
+  amdStats    Json?     // { human: 25, machine: 12, unknown: 3, totalDetected: 40, detectionRate: 0.88 }
+  
+  // Cost Metrics por Campaña
+  costMetrics Json?     // { twilio: 6.25, elevenLabs: 37.50, total: 43.75, costPerMinute: 0.33, costPerCall: 0.55 }
+  
+  // Quality Metrics por Campaña
+  qualityMetrics Json?  // { averageMOS: 4.1, excellent: 20, good: 12, fair: 5, poor: 3, totalRated: 40 }
+  
+  // Status Breakdown por Campaña
+  statusBreakdown Json? // { queued: 5, in_progress: 2, completed: 35, failed: 3 }
+  
+  createdAt   DateTime  @default(now()) @db.Timestamptz(6)
+  updatedAt   DateTime  @updatedAt @db.Timestamptz(6)
+  
+  // Relaciones
+  campaign    Campaign  @relation(fields: [campaignId], references: [id])
+  workspace   Workspace @relation(fields: [workspaceId], references: [id])
+
+  @@unique([date, workspaceId, campaignId])
+  @@index([workspaceId, campaignId, date])
   @@index([workspaceId, date])
 }
 

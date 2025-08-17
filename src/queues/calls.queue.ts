@@ -10,6 +10,7 @@ export type CreateCallJob = {
     agentPhoneNumberId?: string;
     fromNumber: string;
     toNumber: string;
+    campaignId?: string;
     metadata?: Record<string, unknown>;
     variables?: Record<string, unknown>;
     // AMD personalization options
