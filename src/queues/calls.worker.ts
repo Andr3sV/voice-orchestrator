@@ -74,9 +74,13 @@ export const callsWorker = new Worker<CreateCallJob>(
         amdOptions.machineDetectionTimeout = payload.machineDetectionTimeout ?? 6; // Default 6 seconds
         amdOptions.asyncAmd = 'true';
         amdOptions.asyncAmdStatusCallback = amdCallback;
+        amdOptions.statusCallback = `${env.PUBLIC_BASE_URL ?? ''}/webhooks/twilio/status`;
+        amdOptions.statusCallbackEvent = ['completed', 'no-answer', 'busy', 'failed', 'canceled'];
         amdOptions.url = `${env.PUBLIC_BASE_URL ?? ''}/webhooks/twilio/answer`;
       } else {
         // If AMD is disabled, just connect the call directly
+        amdOptions.statusCallback = `${env.PUBLIC_BASE_URL ?? ''}/webhooks/twilio/status`;
+        amdOptions.statusCallbackEvent = ['completed', 'no-answer', 'busy', 'failed', 'canceled'];
         amdOptions.url = `${env.PUBLIC_BASE_URL ?? ''}/webhooks/twilio/answer`;
       }
       
@@ -101,7 +105,8 @@ export const callsWorker = new Worker<CreateCallJob>(
     });
     logger.info({ jobId: job.id, jobType, result }, 'Call created');
     try {
-      await prisma.call.updateMany({
+      // Find the specific call record to avoid duplicates
+      const call = await prisma.call.findFirst({
         where: {
           workspaceId: payload.workspaceId,
           agentId: payload.agentId,
@@ -109,8 +114,15 @@ export const callsWorker = new Worker<CreateCallJob>(
           from: payload.fromNumber,
           status: 'queued',
         },
-        data: { externalRef: result.callId, status: result.status },
+        orderBy: { createdAt: 'desc' }
       });
+
+      if (call) {
+        await prisma.call.update({
+          where: { id: call.id },
+          data: { externalRef: result.callId, status: result.status },
+        });
+      }
     } catch (e) {
       logger.warn({ err: e }, 'Failed to update call record');
     }

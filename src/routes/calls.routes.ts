@@ -538,43 +538,42 @@ export async function registerCallsRoutes(app: FastifyInstance) {
     if (!callId || !agentId) return reply.code(200).send('ok');
 
     try {
-      // Update call record with AMD metrics
-      await prisma.call.updateMany({
+      // Find the specific call record using the job ID (callId parameter)
+      const call = await prisma.call.findFirst({
         where: { 
           workspaceId: '1', // TODO: make this dynamic
           agentId,
-          status: 'queued'
+          status: 'queued',
+          // Use the job ID to find the specific call
+          id: callId
         },
-        data: {
-          amdStatus: amdStatus,
-          amdConfidence: amdConfidence,
-          amdDetectionTime: 4, // Default detection time
-          twilioCallSid: params['CallSid'] || null,
-          // Initialize cost tracking
-          costTwilio: 0.025, // Estimated Twilio AMD cost per call
-          costElevenLabs: null, // Will be updated when call completes
-        },
+        orderBy: { createdAt: 'desc' }
       });
 
-      if (amdStatus === 'human') {
-        // For AMD bridge, we already created the ElevenLabs call, just connect it
-        // The callId here is the job ID, we need to find the actual call record
-        const call = await prisma.call.findFirst({
-          where: { 
-            workspaceId: '1', // TODO: make this dynamic
-            agentId,
-            status: 'queued'
+      if (call) {
+        // Update the specific call record with AMD metrics
+        await prisma.call.update({
+          where: { id: call.id },
+          data: {
+            amdStatus: amdStatus,
+            amdConfidence: amdConfidence,
+            amdDetectionTime: 4, // Default detection time
+            twilioCallSid: params['CallSid'] || null,
+            // Initialize cost tracking
+            costTwilio: 0.025, // Estimated Twilio AMD cost per call
+            costElevenLabs: null, // Will be updated when call completes
           },
-          orderBy: { createdAt: 'desc' }
         });
-        
-        if (call && call.externalRef) {
-          // Call was already created via ElevenLabs SIP trunk, just connect
-          const VoiceResponse = twilio.twiml.VoiceResponse;
-          const twiml = new VoiceResponse();
-          twiml.dial({}, '+34881556005'); // Connect to sales person
-          reply.header('Content-Type', 'text/xml');
-          return reply.send(twiml.toString());
+
+        if (amdStatus === 'human') {
+          // For AMD bridge, we already created the ElevenLabs call, just connect it
+          if (call.externalRef) {
+            const VoiceResponse = twilio.twiml.VoiceResponse;
+            const twiml = new VoiceResponse();
+            twiml.dial({}, '+34881556005'); // Connect to sales person
+            reply.header('Content-Type', 'text/xml');
+            return reply.send(twiml.toString());
+          }
         }
       }
     } catch (error) {
@@ -587,6 +586,83 @@ export async function registerCallsRoutes(app: FastifyInstance) {
     twiml.hangup();
     reply.header('Content-Type', 'text/xml');
     return reply.send(twiml.toString());
+  });
+
+  // Twilio: Status callback webhook for call completion
+  app.post('/webhooks/twilio/status', async (request, reply) => {
+    const params = request.body as Record<string, string>;
+    const callSid = params['CallSid'];
+    const callStatus = params['CallStatus'];
+    const callDuration = params['CallDuration'] ? parseInt(params['CallDuration']) : 0;
+    const answeredBy = params['AnsweredBy'];
+    
+    logger.info({ callSid, callStatus, callDuration, answeredBy }, 'Twilio status callback received');
+
+    if (!callSid) return reply.code(200).send('ok');
+
+    try {
+      // Find the call record using the Twilio Call SID
+      const call = await prisma.call.findFirst({
+        where: { 
+          twilioCallSid: callSid,
+          status: { in: ['queued', 'in_progress'] }
+        }
+      });
+
+      if (call) {
+        // Map Twilio status to our internal status
+        let newStatus: string;
+        let durationSeconds: number | null = null;
+
+        switch (callStatus) {
+          case 'completed':
+            newStatus = 'completed';
+            durationSeconds = callDuration;
+            break;
+          case 'no-answer':
+            newStatus = 'no_answer';
+            break;
+          case 'busy':
+            newStatus = 'busy';
+            break;
+          case 'failed':
+            newStatus = 'failed';
+            break;
+          case 'canceled':
+            newStatus = 'canceled';
+            break;
+          default:
+            newStatus = 'failed';
+        }
+
+        // Update the call record with final status and duration
+        await prisma.call.update({
+          where: { id: call.id },
+          data: {
+            status: newStatus,
+            durationSeconds: durationSeconds,
+            // Update costs based on duration
+            costTwilio: callDuration > 0 ? (callDuration / 60) * 0.025 : 0.025, // Twilio cost per minute
+            costElevenLabs: callDuration > 0 ? (callDuration / 60) * 0.15 : 0.15, // ElevenLabs cost per minute
+            // Update call quality metrics if available
+            callQuality: callDuration > 0 ? 'good' : 'poor',
+            mosScore: callDuration > 0 ? 4.0 : 1.0, // Default MOS score
+          },
+        });
+
+        logger.info({ 
+          callId: call.id, 
+          callSid, 
+          oldStatus: call.status, 
+          newStatus, 
+          durationSeconds 
+        }, 'Call status updated');
+      }
+    } catch (error) {
+      logger.error({ error, callSid, callStatus }, 'Failed to update call status');
+    }
+
+    return reply.code(200).send('ok');
   });
 
   // Bulk create (queued)
