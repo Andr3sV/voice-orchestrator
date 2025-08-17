@@ -533,24 +533,47 @@ export async function registerCallsRoutes(app: FastifyInstance) {
     const result = (params['AnsweredBy'] || '').toLowerCase();
     const amdStatus = result.includes('human') ? 'human' : 'machine';
     const amdConfidence = params['AmdConfidence'] ? parseFloat(params['AmdConfidence']) : null;
+    const twilioCallSid = params['CallSid'];
     
-    logger.info({ workspaceId, agentId, to, amdStatus, amdConfidence }, 'AMD callback received');
+    logger.info({ 
+      workspaceId, 
+      agentId, 
+      to, 
+      amdStatus, 
+      amdConfidence, 
+      twilioCallSid,
+      allParams: params 
+    }, 'AMD callback received with full details');
 
-    if (!workspaceId || !agentId) return reply.code(200).send('ok');
+    if (!workspaceId || !agentId) {
+      logger.warn({ workspaceId, agentId }, 'AMD callback missing required query params');
+      return reply.code(200).send('ok');
+    }
 
     try {
       // Match latest queued call for this workspace/agent/(to)
+      const searchCriteria = { 
+        workspaceId,
+        agentId,
+        ...(to ? { to } : {}),
+        status: 'queued',
+      };
+      
+      logger.info({ searchCriteria }, 'Searching for call with criteria');
+      
       const call = await prisma.call.findFirst({
-        where: { 
-          workspaceId,
-          agentId,
-          ...(to ? { to } : {}),
-          status: 'queued',
-        },
+        where: searchCriteria,
         orderBy: { createdAt: 'desc' }
       });
 
       if (call) {
+        logger.info({ 
+          callId: call.id, 
+          callTo: call.to, 
+          callStatus: call.status, 
+          callCreated: call.createdAt 
+        }, 'Found matching call for AMD update');
+        
         // Update AMD metrics and mark in_progress if human
         await prisma.call.update({
           where: { id: call.id },
@@ -558,11 +581,17 @@ export async function registerCallsRoutes(app: FastifyInstance) {
             amdStatus,
             amdConfidence,
             amdDetectionTime: 4,
-            twilioCallSid: params['CallSid'] || call.twilioCallSid || null,
+            twilioCallSid: twilioCallSid || call.twilioCallSid || null,
             costTwilio: 0.025,
             ...(amdStatus === 'human' ? { status: 'in_progress' } : {}),
           },
         });
+
+        logger.info({ 
+          callId: call.id, 
+          newStatus: amdStatus === 'human' ? 'in_progress' : call.status,
+          twilioCallSid 
+        }, 'Successfully updated call with AMD data');
 
         if (amdStatus === 'human') {
           const VoiceResponse = twilio.twiml.VoiceResponse;
@@ -571,9 +600,11 @@ export async function registerCallsRoutes(app: FastifyInstance) {
           reply.header('Content-Type', 'text/xml');
           return reply.send(twiml.toString());
         }
+      } else {
+        logger.warn({ searchCriteria, twilioCallSid }, 'No matching call found for AMD callback');
       }
     } catch (error) {
-      logger.error({ error, workspaceId, agentId, to }, 'Failed to update AMD metrics');
+      logger.error({ error, workspaceId, agentId, to, twilioCallSid }, 'Failed to update AMD metrics');
     }
 
     const VoiceResponse = twilio.twiml.VoiceResponse;
@@ -591,20 +622,41 @@ export async function registerCallsRoutes(app: FastifyInstance) {
     const callDuration = params['CallDuration'] ? parseInt(params['CallDuration']) : 0;
     const answeredBy = params['AnsweredBy'];
     
-    logger.info({ callSid, callStatus, callDuration, answeredBy }, 'Twilio status callback received');
+    logger.info({ 
+      callSid, 
+      callStatus, 
+      callDuration, 
+      answeredBy, 
+      allParams: params 
+    }, 'Twilio status callback received with full details');
 
-    if (!callSid) return reply.code(200).send('ok');
+    if (!callSid) {
+      logger.warn('Status callback missing CallSid');
+      return reply.code(200).send('ok');
+    }
 
     try {
+      // Search for call by Twilio Call SID
+      const searchCriteria = { 
+        twilioCallSid: callSid,
+        status: { in: ['queued', 'in_progress'] }
+      };
+      
+      logger.info({ searchCriteria }, 'Searching for call by twilioCallSid');
+      
       // Find the call record using the Twilio Call SID
       const call = await prisma.call.findFirst({
-        where: { 
-          twilioCallSid: callSid,
-          status: { in: ['queued', 'in_progress'] }
-        }
+        where: searchCriteria
       });
 
       if (call) {
+        logger.info({ 
+          callId: call.id, 
+          callTo: call.to, 
+          currentStatus: call.status, 
+          twilioCallSid: call.twilioCallSid 
+        }, 'Found matching call for status update');
+        
         // Map Twilio status to our internal status
         let newStatus: string;
         let durationSeconds: number | null = null;
@@ -651,7 +703,24 @@ export async function registerCallsRoutes(app: FastifyInstance) {
           oldStatus: call.status, 
           newStatus, 
           durationSeconds 
-        }, 'Call status updated');
+        }, 'Successfully updated call status');
+      } else {
+        logger.warn({ searchCriteria, callSid, callStatus }, 'No matching call found for status callback');
+        
+        // Also search without status filter to see if call exists at all
+        const anyCall = await prisma.call.findFirst({
+          where: { twilioCallSid: callSid }
+        });
+        
+        if (anyCall) {
+          logger.info({ 
+            callId: anyCall.id, 
+            callStatus: anyCall.status, 
+            twilioCallSid: anyCall.twilioCallSid 
+          }, 'Found call but status not in [queued, in_progress]');
+        } else {
+          logger.warn({ callSid }, 'No call found with this twilioCallSid at all');
+        }
       }
     } catch (error) {
       logger.error({ error, callSid, callStatus }, 'Failed to update call status');
