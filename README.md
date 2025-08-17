@@ -166,11 +166,13 @@ El servicio implementa un **sistema híbrido de métricas** que combina:
 ### **Endpoints de Métricas:**
 
 #### **GET /calls/amd-stats** - Estadísticas AMD
+
 ```http
 GET /calls/amd-stats?workspaceId=1&from=2024-08-01T00:00:00Z&to=2024-08-17T23:59:59Z&campaignId=123
 ```
 
 **Respuesta:**
+
 ```json
 {
   "totalCalls": 150,
@@ -192,11 +194,13 @@ GET /calls/amd-stats?workspaceId=1&from=2024-08-01T00:00:00Z&to=2024-08-17T23:59
 ```
 
 #### **GET /calls/cost-analysis** - Análisis de Costos
+
 ```http
 GET /calls/cost-analysis?workspaceId=1&from=2024-08-01T00:00:00Z&to=2024-08-17T23:59:59Z&campaignId=123
 ```
 
 **Respuesta:**
+
 ```json
 {
   "totalMinutes": 180.5,
@@ -206,17 +210,19 @@ GET /calls/cost-analysis?workspaceId=1&from=2024-08-01T00:00:00Z&to=2024-08-17T2
     "total": 29.33
   },
   "costPerMinute": 0.16,
-  "costPerCall": 0.20,
+  "costPerCall": 0.2,
   "savingsFromAMD": 13.5
 }
 ```
 
 #### **GET /calls/quality-metrics** - Métricas de Calidad
+
 ```http
 GET /calls/quality-metrics?workspaceId=1&from=2024-08-01T00:00:00Z&to=2024-08-17T23:59:59Z&campaignId=123
 ```
 
 **Respuesta:**
+
 ```json
 {
   "averageCallQuality": "good",
@@ -235,6 +241,7 @@ GET /calls/quality-metrics?workspaceId=1&from=2024-08-01T00:00:00Z&to=2024-08-17
 ```
 
 #### **GET /calls/campaign-dashboard** - Dashboard de Campaña
+
 ```http
 GET /calls/campaign-dashboard?workspaceId=1&campaignId=123&from=2024-08-01T00:00:00Z&to=2024-08-17T23:59:59Z
 ```
@@ -242,6 +249,7 @@ GET /calls/campaign-dashboard?workspaceId=1&campaignId=123&from=2024-08-01T00:00
 **Respuesta completa** con todas las métricas integradas.
 
 #### **GET /calls/workspace-overview** - Vista General del Workspace
+
 ```http
 GET /calls/workspace-overview?workspaceId=1&from=2024-08-01T00:00:00Z&to=2024-08-17T23:59:59Z
 ```
