@@ -29,7 +29,7 @@ export const callsWorker = new Worker<CreateCallJob>(
       // Use ElevenLabs SIP trunk for the actual call, Twilio only for AMD detection
       const client = twilio(env.TWILIO_ACCOUNT_SID, env.TWILIO_AUTH_TOKEN);
       const from = (job.data.payload as any).fromNumber;
-      const amdCallback = `${env.PUBLIC_BASE_URL ?? ''}/webhooks/twilio/amd?callId=${encodeURIComponent(job.id ?? 'unknown')}&agentId=${encodeURIComponent(job.data.payload.agentId)}`;
+      const amdCallback = `${env.PUBLIC_BASE_URL ?? ''}/webhooks/twilio/amd?workspaceId=${encodeURIComponent(payload.workspaceId)}&agentId=${encodeURIComponent(job.data.payload.agentId)}&to=${encodeURIComponent((job.data.payload as any).toNumber)}`;
       
       // Create call via ElevenLabs SIP trunk first
       const elevenLabsResult = await elevenLabsClient.createOutboundCall({

@@ -27,7 +27,8 @@ const defaultOpts: QueueOptions = {
   defaultJobOptions: {
     removeOnComplete: true,
     removeOnFail: 1000,
-    attempts: 3,
+    // Important: avoid duplicate dials due to automatic retries
+    attempts: 1,
     backoff: {
       type: 'exponential',
       delay: 2000,

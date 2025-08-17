@@ -527,60 +527,55 @@ export async function registerCallsRoutes(app: FastifyInstance) {
   // Twilio: AMD async callback
   app.post('/webhooks/twilio/amd', async (request, reply) => {
     const params = request.body as Record<string, string>;
-    const callId = (request.query as any)?.callId as string | undefined;
+    const workspaceId = (request.query as any)?.workspaceId as string | undefined;
     const agentId = (request.query as any)?.agentId as string | undefined;
+    const to = (request.query as any)?.to as string | undefined;
     const result = (params['AnsweredBy'] || '').toLowerCase();
     const amdStatus = result.includes('human') ? 'human' : 'machine';
     const amdConfidence = params['AmdConfidence'] ? parseFloat(params['AmdConfidence']) : null;
     
-    logger.info({ callId, agentId, amdStatus, amdConfidence }, 'AMD callback received');
+    logger.info({ workspaceId, agentId, to, amdStatus, amdConfidence }, 'AMD callback received');
 
-    if (!callId || !agentId) return reply.code(200).send('ok');
+    if (!workspaceId || !agentId) return reply.code(200).send('ok');
 
     try {
-      // Find the specific call record using the job ID (callId parameter)
+      // Match latest queued call for this workspace/agent/(to)
       const call = await prisma.call.findFirst({
         where: { 
-          workspaceId: '1', // TODO: make this dynamic
+          workspaceId,
           agentId,
+          ...(to ? { to } : {}),
           status: 'queued',
-          // Use the job ID to find the specific call
-          id: callId
         },
         orderBy: { createdAt: 'desc' }
       });
 
       if (call) {
-        // Update the specific call record with AMD metrics
+        // Update AMD metrics and mark in_progress if human
         await prisma.call.update({
           where: { id: call.id },
           data: {
-            amdStatus: amdStatus,
-            amdConfidence: amdConfidence,
-            amdDetectionTime: 4, // Default detection time
-            twilioCallSid: params['CallSid'] || null,
-            // Initialize cost tracking
-            costTwilio: 0.025, // Estimated Twilio AMD cost per call
-            costElevenLabs: null, // Will be updated when call completes
+            amdStatus,
+            amdConfidence,
+            amdDetectionTime: 4,
+            twilioCallSid: params['CallSid'] || call.twilioCallSid || null,
+            costTwilio: 0.025,
+            ...(amdStatus === 'human' ? { status: 'in_progress' } : {}),
           },
         });
 
         if (amdStatus === 'human') {
-          // For AMD bridge, we already created the ElevenLabs call, just connect it
-          if (call.externalRef) {
-            const VoiceResponse = twilio.twiml.VoiceResponse;
-            const twiml = new VoiceResponse();
-            twiml.dial({}, '+34881556005'); // Connect to sales person
-            reply.header('Content-Type', 'text/xml');
-            return reply.send(twiml.toString());
-          }
+          const VoiceResponse = twilio.twiml.VoiceResponse;
+          const twiml = new VoiceResponse();
+          twiml.dial({}, '+34881556005');
+          reply.header('Content-Type', 'text/xml');
+          return reply.send(twiml.toString());
         }
       }
     } catch (error) {
-      logger.error({ error, callId, agentId }, 'Failed to update AMD metrics');
+      logger.error({ error, workspaceId, agentId, to }, 'Failed to update AMD metrics');
     }
 
-    // machine or no mapping: hangup
     const VoiceResponse = twilio.twiml.VoiceResponse;
     const twiml = new VoiceResponse();
     twiml.hangup();
