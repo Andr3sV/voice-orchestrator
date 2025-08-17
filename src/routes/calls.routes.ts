@@ -663,7 +663,10 @@ export async function registerCallsRoutes(app: FastifyInstance) {
       };
       if (c.metadata) payload.metadata = c.metadata;
       if (body.campaignId) payload.campaignId = body.campaignId;
-      if (body.gateMode) payload.gateMode = body.gateMode;
+      // For bulk calls, default to twilio_amd_bridge when agentPhoneNumberId is present
+      if (a.agentPhoneNumberId) {
+        payload.gateMode = 'twilio_amd_bridge';
+      }
       return { jobType: 'BULK' as const, payload };
     });
 
