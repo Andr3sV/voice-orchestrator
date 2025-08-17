@@ -81,12 +81,12 @@ export const callsWorker = new Worker<CreateCallJob>(
         amdOptions.asyncAmd = 'true';
         amdOptions.asyncAmdStatusCallback = amdCallback;
         amdOptions.statusCallback = `${env.PUBLIC_BASE_URL ?? ''}/webhooks/twilio/status`;
-        amdOptions.statusCallbackEvent = ['completed', 'no-answer', 'busy', 'failed', 'canceled'];
+        amdOptions.statusCallbackEvent = ['initiated', 'ringing', 'answered', 'completed'];
         amdOptions.url = `${env.PUBLIC_BASE_URL ?? ''}/webhooks/twilio/answer`;
       } else {
         // If AMD is disabled, just connect the call directly
         amdOptions.statusCallback = `${env.PUBLIC_BASE_URL ?? ''}/webhooks/twilio/status`;
-        amdOptions.statusCallbackEvent = ['completed', 'no-answer', 'busy', 'failed', 'canceled'];
+        amdOptions.statusCallbackEvent = ['initiated', 'ringing', 'answered', 'completed'];
         amdOptions.url = `${env.PUBLIC_BASE_URL ?? ''}/webhooks/twilio/answer`;
       }
       
