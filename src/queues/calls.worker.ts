@@ -44,23 +44,29 @@ export const callsWorker = new Worker<CreateCallJob>(
 
       // Update call record with ElevenLabs details and estimated costs
       try {
-        await prisma.call.updateMany({
+        // Find the specific call record to avoid duplicates
+        const call = await prisma.call.findFirst({
           where: {
             workspaceId: payload.workspaceId,
             agentId: payload.agentId,
             to: payload.toNumber,
             status: 'queued',
           },
-          data: {
-            externalRef: elevenLabsResult.callId,
-            status: elevenLabsResult.status,
-            agentModel: payload.agentId, // Store agent model for cost calculation
-            sipTrunkUsed: (payload as any).agentPhoneNumberId,
-            campaignId: (payload as any).campaignId,
-            // Initialize ElevenLabs cost (will be updated when call completes)
-            costElevenLabs: 0.15, // Estimated cost per minute
-          },
+          orderBy: { createdAt: 'desc' }
         });
+
+        if (call) {
+          await prisma.call.update({
+            where: { id: call.id },
+            data: {
+              externalRef: elevenLabsResult.callId,
+              status: elevenLabsResult.status,
+              campaignId: (payload as any).campaignId,
+              // Initialize ElevenLabs cost (will be updated when call completes)
+              costElevenLabs: 0.15, // Estimated cost per minute
+            },
+          });
+        }
       } catch (e) {
         logger.warn({ err: e }, 'Failed to update call record with ElevenLabs details');
       }
