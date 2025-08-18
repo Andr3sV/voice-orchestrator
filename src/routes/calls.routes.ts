@@ -548,16 +548,17 @@ export async function registerCallsRoutes(app: FastifyInstance) {
         if (workspaceId && agentId && to) {
           const call = await prisma.call.findFirst({ where: { workspaceId, agentId, to }, orderBy: { createdAt: 'desc' } });
           const meta: any = call?.metadata || {};
-          const sipBase = (env as any).ELEVENLABS_SIP_ADDRESS || 'sip:elevenlabs@elevenlabs.invalid';
+          const sipBase = env.ELEVENLABS_SIP_ADDRESS || 'sip.elevenlabs.io';
           const qp = [
             `X-Workspace-Id=${encodeURIComponent(workspaceId)}`,
             `X-Agent-Id=${encodeURIComponent(agentId)}`,
             `X-Lead-Number=${encodeURIComponent(to)}`,
           ];
           if (meta.agentPhoneNumberId) qp.push(`X-Agent-PhoneId=${encodeURIComponent(meta.agentPhoneNumberId)}`);
-          const sipUri = `${sipBase};transport=tls?${qp.join('&')}`;
+          const sipUri = `sip:${sipBase};transport=tls?${qp.join('&')}`;
           const dial = twiml.dial({ callerId: (call?.from ?? '') as any, answerOnBridge: true } as any);
           dial.sip(sipUri);
+          logger.info({ sipUri, workspaceId, agentId, to }, 'Dialing ElevenLabs SIP trunk');
           // Mark in_progress on connect attempt
           if (call) {
             await prisma.call.update({ where: { id: call.id }, data: { status: 'in_progress' } });

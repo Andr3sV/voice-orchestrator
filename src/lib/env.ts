@@ -10,6 +10,7 @@ type RequiredEnv = {
 
 type OptionalEnv = {
 	ELEVENLABS_OUTBOUND_CALLS_PATH: string | undefined; // e.g. /v1/voice/agents/{agentId}/calls
+	ELEVENLABS_SIP_ADDRESS?: string; // ElevenLabs SIP trunk address
 	SERVICE_PORT: string | undefined;
 	TWILIO_ACCOUNT_SID?: string;
 	TWILIO_AUTH_TOKEN?: string;
@@ -36,6 +37,7 @@ export const env: Env = {
 	ELEVENLABS_BASE_URL: ensureEnvVariable('ELEVENLABS_BASE_URL', process.env.ELEVENLABS_BASE_URL),
 	REDIS_URL: ensureEnvVariable('REDIS_URL', process.env.REDIS_URL),
 	ELEVENLABS_OUTBOUND_CALLS_PATH: process.env.ELEVENLABS_OUTBOUND_CALLS_PATH,
+	ELEVENLABS_SIP_ADDRESS: process.env.ELEVENLABS_SIP_ADDRESS,
 	SERVICE_PORT: process.env.PORT ?? process.env.SERVICE_PORT,
 	RETENTION_DAYS: Number.parseInt(process.env.RETENTION_DAYS || '15', 10),
 	TWILIO_ACCOUNT_SID: process.env.TWILIO_ACCOUNT_SID,
