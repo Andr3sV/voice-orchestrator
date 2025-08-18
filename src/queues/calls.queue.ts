@@ -13,6 +13,8 @@ export type CreateCallJob = {
     campaignId?: string;
     metadata?: Record<string, unknown>;
     variables?: Record<string, unknown>;
+    // Call mode selection
+    callMode?: 'trunk' | 'conference';
     // AMD personalization options
     machineDetectionTimeout?: number;
     enableMachineDetection?: boolean;

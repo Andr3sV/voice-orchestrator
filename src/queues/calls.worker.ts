@@ -21,35 +21,33 @@ export const callsWorker = new Worker<CreateCallJob>(
       // For true per-job concurrency control, we'd need to implement job-specific workers
     }
     const { payload, jobType } = job.data;
-    // Support gateMode Twilio AMD bridge for bulk
-    const gateMode = (job.data?.payload as any)?.gateMode as 'twilio_amd_bridge' | undefined;
-    console.log('Worker processing job with gateMode:', gateMode, 'payload:', JSON.stringify(job.data?.payload));
-    if (gateMode === 'twilio_amd_bridge' && env.TWILIO_ACCOUNT_SID && env.TWILIO_AUTH_TOKEN) {
+    // Support dual call modes: trunk (ElevenLabs direct) or conference (Twilio AMD + bridge)
+    const callMode = (job.data?.payload as any)?.callMode as 'trunk' | 'conference' | undefined;
+    const gateMode = (job.data?.payload as any)?.gateMode as 'twilio_amd_bridge' | undefined; // Legacy fallback
+    
+    // Determine effective call mode
+    let effectiveCallMode = callMode;
+    if (!effectiveCallMode && gateMode === 'twilio_amd_bridge') {
+      effectiveCallMode = 'conference';
+    }
+    
+    console.log('Worker processing job with callMode:', effectiveCallMode, 'payload:', JSON.stringify(job.data?.payload));
+    
+    if (effectiveCallMode === 'conference' && env.TWILIO_ACCOUNT_SID && env.TWILIO_AUTH_TOKEN) {
       // Twilio-only for AMD detection. We will hand off to ElevenLabs after AMD=human via webhook.
       const client = twilio(env.TWILIO_ACCOUNT_SID, env.TWILIO_AUTH_TOKEN);
       const from = (job.data.payload as any).fromNumber || (env as any).TWILIO_DEFAULT_FROM || '+34881193139';
-      const amdCallback = `${env.PUBLIC_BASE_URL ?? ''}/webhooks/twilio/amd?workspaceId=${encodeURIComponent(payload.workspaceId)}&agentId=${encodeURIComponent(job.data.payload.agentId)}&to=${encodeURIComponent((job.data.payload as any).toNumber)}`;
+      const answerUrl = `${env.PUBLIC_BASE_URL ?? ''}/webhooks/twilio/answer?workspaceId=${encodeURIComponent(payload.workspaceId)}&agentId=${encodeURIComponent(job.data.payload.agentId)}&to=${encodeURIComponent((job.data.payload as any).toNumber)}`;
 
       // Configure AMD options
       const amdOptions: any = {};
       
-      // Apply personalized AMD settings
-      if (payload.enableMachineDetection !== false) { // Default to true if not specified
-        amdOptions.machineDetection = 'Enable';
-        amdOptions.machineDetectionTimeout = payload.machineDetectionTimeout ?? 6; // Default 6 seconds
-        amdOptions.asyncAmd = 'true';
-        amdOptions.asyncAmdStatusCallback = amdCallback;
-        amdOptions.amdStatusCallback = amdCallback;
-        amdOptions.amdCallbackMethod = 'POST';
-        amdOptions.statusCallback = `${env.PUBLIC_BASE_URL ?? ''}/webhooks/twilio/status`;
-        amdOptions.statusCallbackEvent = ['initiated', 'ringing', 'answered', 'completed'];
-        amdOptions.url = `${env.PUBLIC_BASE_URL ?? ''}/webhooks/twilio/answer`;
-      } else {
-        // If AMD is disabled, just connect the call directly
-        amdOptions.statusCallback = `${env.PUBLIC_BASE_URL ?? ''}/webhooks/twilio/status`;
-        amdOptions.statusCallbackEvent = ['initiated', 'ringing', 'answered', 'completed'];
-        amdOptions.url = `${env.PUBLIC_BASE_URL ?? ''}/webhooks/twilio/answer`;
-      }
+      // Apply personalized AMD settings (synchronous AMD)
+      amdOptions.machineDetection = 'Enable';
+      amdOptions.machineDetectionTimeout = payload.machineDetectionTimeout ?? 6;
+      amdOptions.statusCallback = `${env.PUBLIC_BASE_URL ?? ''}/webhooks/twilio/status`;
+      amdOptions.statusCallbackEvent = ['initiated', 'ringing', 'answered', 'completed'];
+      amdOptions.url = answerUrl;
       
       const twilioCall = await client.calls.create({
         to: job.data.payload.toNumber,
@@ -88,10 +86,12 @@ export const callsWorker = new Worker<CreateCallJob>(
         logger.warn({ err: e }, 'Failed to update call record with Twilio details');
       }
 
-      logger.info({ jobId: job.id, jobType, mode: 'twilio_amd_bridge', twilioCallSid: twilioCall.sid }, 'Twilio AMD bridge call created');
+      logger.info({ jobId: job.id, jobType, mode: 'conference', twilioCallSid: twilioCall.sid }, 'Conference mode (Twilio AMD bridge) call created');
       return { callId: twilioCall.sid, status: 'queued' };
     }
 
+    // Trunk mode: Direct ElevenLabs call with SIP REFER support
+    logger.info({ jobId: job.id, jobType, mode: effectiveCallMode || 'trunk' }, 'Processing trunk mode (direct ElevenLabs) call');
     const result = await elevenLabsClient.createOutboundCall({
       workspaceId: payload.workspaceId,
       agentId: payload.agentId,

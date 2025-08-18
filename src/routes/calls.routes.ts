@@ -47,6 +47,8 @@ const createPrioritySchema = z.object({
   campaignId: z.string().min(1).optional(),
   metadata: z.record(z.string(), z.unknown()).optional() as unknown as z.ZodType<Record<string, unknown> | undefined>,
   variables: z.record(z.string(), z.unknown()).optional() as unknown as z.ZodType<Record<string, unknown> | undefined>,
+  // Call mode selection
+  callMode: z.enum(['trunk', 'conference']).optional(),
   // AMD personalization options
   machineDetectionTimeout: z.number().min(1).max(30).optional(),
   enableMachineDetection: z.boolean().optional(),
@@ -67,7 +69,9 @@ const createBulkSchema = z.object({
   fromNumber: z.string().min(5).optional(),
   // New multi-agent distribution
   agents: z.array(bulkAgentEntrySchema).optional(),
-  gateMode: z.enum(['twilio_amd_bridge', 'twilio_amd_handoff']).optional(),
+  // Call mode selection
+  callMode: z.enum(['trunk', 'conference']).optional(),
+  gateMode: z.enum(['twilio_amd_bridge', 'twilio_amd_handoff']).optional(), // Legacy support
   campaignId: z.string().optional(),
   // AMD personalization options
   machineDetectionTimeout: z.number().min(1).max(30).optional(),
@@ -467,9 +471,20 @@ export async function registerCallsRoutes(app: FastifyInstance) {
       },
     });
 
-    const gateMode = (request.headers['x-gate-mode'] as string | undefined) ?? (request as any).body?.gateMode;
-    // For AMD bridge, send to worker; otherwise process directly
-    if (gateMode === 'twilio_amd_bridge') {
+    // Determine call mode - prioritize callMode, fallback to gateMode mapping
+    let callMode = body.callMode;
+    if (!callMode) {
+      const gateMode = (request.headers['x-gate-mode'] as string | undefined) ?? (request as any).body?.gateMode;
+      // Map legacy gateMode to callMode
+      if (gateMode === 'twilio_amd_bridge') {
+        callMode = 'conference';
+      } else if (gateMode === 'elevenlabs_direct') {
+        callMode = 'trunk';
+      }
+    }
+
+    // For conference mode, send to worker; otherwise process directly
+    if (callMode === 'conference') {
       // Send to worker for AMD bridge processing
       const { addPriorityCall } = await import('../queues/calls.worker.js');
       await addPriorityCall({
@@ -483,16 +498,17 @@ export async function registerCallsRoutes(app: FastifyInstance) {
           ...(body.campaignId ? { campaignId: body.campaignId } : {}),
           ...(body.metadata ? { metadata: body.metadata } : {}),
           variables: withDefaultVariables(body.variables),
+          callMode, // Add call mode to payload
           // Pass AMD personalization options
           ...(body.machineDetectionTimeout ? { machineDetectionTimeout: body.machineDetectionTimeout } : {}),
           ...(body.enableMachineDetection !== undefined ? { enableMachineDetection: body.enableMachineDetection } : {}),
           ...(body.concurrency ? { concurrency: body.concurrency } : {}),
-        },
+        } as any,
       });
-      return reply.code(201).send({ created: true, callId: call.id, externalRef: null, mode: 'twilio_amd_bridge' });
+      return reply.code(201).send({ created: true, callId: call.id, externalRef: null, mode: callMode });
     }
 
-    // Process direct calls normally
+    // Process trunk mode calls (direct ElevenLabs)
     if (process.env.DISABLE_WORKERS === '1') {
       return reply.code(201).send({ created: true, callId: call.id, externalRef: null, note: 'Workers disabled: outbound skipped' });
     }
@@ -515,11 +531,47 @@ export async function registerCallsRoutes(app: FastifyInstance) {
     return reply.code(201).send({ created: true, callId: call.id, externalRef: result.callId });
   });
 
-  // Twilio: basic answer webhook (TwiML)
-  app.all('/webhooks/twilio/answer', async (_req, reply) => {
+  // Twilio: answer webhook with synchronous AMD branching
+  app.all('/webhooks/twilio/answer', async (req, reply) => {
+    const q = req.query as any;
+    const answeredBy = (req.body as any)?.AnsweredBy || q?.AnsweredBy || '';
+    const workspaceId = q?.workspaceId as string | undefined;
+    const agentId = q?.agentId as string | undefined;
+    const to = q?.to as string | undefined;
+
     const VoiceResponse = twilio.twiml.VoiceResponse;
     const twiml = new VoiceResponse();
-    twiml.pause({ length: 1 });
+
+    // Human: connect existing leg to ElevenLabs via SIP trunk (single leg, pass routing via SIP headers)
+    if ((answeredBy || '').toLowerCase().includes('human')) {
+      try {
+        if (workspaceId && agentId && to) {
+          const call = await prisma.call.findFirst({ where: { workspaceId, agentId, to }, orderBy: { createdAt: 'desc' } });
+          const meta: any = call?.metadata || {};
+          const sipBase = (env as any).ELEVENLABS_SIP_ADDRESS || 'sip:elevenlabs@elevenlabs.invalid';
+          const qp = [
+            `X-Workspace-Id=${encodeURIComponent(workspaceId)}`,
+            `X-Agent-Id=${encodeURIComponent(agentId)}`,
+            `X-Lead-Number=${encodeURIComponent(to)}`,
+          ];
+          if (meta.agentPhoneNumberId) qp.push(`X-Agent-PhoneId=${encodeURIComponent(meta.agentPhoneNumberId)}`);
+          const sipUri = `${sipBase};transport=tls?${qp.join('&')}`;
+          const dial = twiml.dial({ callerId: (call?.from ?? '') as any, answerOnBridge: true } as any);
+          dial.sip(sipUri);
+          // Mark in_progress on connect attempt
+          if (call) {
+            await prisma.call.update({ where: { id: call.id }, data: { status: 'in_progress' } });
+          }
+        }
+      } catch (e) {
+        logger.error({ e }, 'Failed ElevenLabs SIP handoff');
+      }
+      reply.header('Content-Type', 'text/xml');
+      return reply.send(twiml.toString());
+    }
+
+    // Machine: hangup
+    twiml.hangup();
     reply.header('Content-Type', 'text/xml');
     return reply.send(twiml.toString());
   });
@@ -574,22 +626,17 @@ export async function registerCallsRoutes(app: FastifyInstance) {
           callCreated: call.createdAt 
         }, 'Found matching call for AMD update');
         
-        // Update AMD metrics and mark in_progress if human
+        // Update status based on AMD and keep minimal fields (schema-safe)
         await prisma.call.update({
           where: { id: call.id },
           data: {
-            amdStatus,
-            amdConfidence,
-            amdDetectionTime: 4,
-            twilioCallSid: twilioCallSid || call.twilioCallSid || null,
-            costTwilio: 0.025,
-            ...(amdStatus === 'human' ? { status: 'in_progress' } : {}),
+            ...(amdStatus === 'human' ? { status: 'in_progress' } : { status: 'no_answer' as any }),
           },
         });
 
         logger.info({ 
           callId: call.id, 
-          newStatus: amdStatus === 'human' ? 'in_progress' : call.status,
+          newStatus: amdStatus === 'human' ? 'in_progress' : 'no_answer',
           twilioCallSid 
         }, 'Successfully updated call with AMD data');
 
@@ -636,25 +683,16 @@ export async function registerCallsRoutes(app: FastifyInstance) {
     }
 
     try {
-      // Search for call by Twilio Call SID
-      const searchCriteria = { 
-        twilioCallSid: callSid,
-        status: { in: ['queued', 'in_progress'] }
-      };
-      
-      logger.info({ searchCriteria }, 'Searching for call by twilioCallSid');
-      
-      // Find the call record using the Twilio Call SID
-      const call = await prisma.call.findFirst({
-        where: searchCriteria
-      });
+      // Find the call record using the Twilio Call SID stored in externalRef
+      logger.info({ callSid }, 'Searching for call by externalRef');
+      const call = await prisma.call.findFirst({ where: { externalRef: callSid } });
 
       if (call) {
         logger.info({ 
           callId: call.id, 
           callTo: call.to, 
           currentStatus: call.status, 
-          twilioCallSid: call.twilioCallSid 
+          externalRef: call.externalRef 
         }, 'Found matching call for status update');
         
         // Map Twilio status to our internal status
@@ -688,12 +726,7 @@ export async function registerCallsRoutes(app: FastifyInstance) {
           data: {
             status: newStatus,
             durationSeconds: durationSeconds,
-            // Update costs based on duration
-            costTwilio: callDuration > 0 ? (callDuration / 60) * 0.025 : 0.025, // Twilio cost per minute
-            costElevenLabs: callDuration > 0 ? (callDuration / 60) * 0.15 : 0.15, // ElevenLabs cost per minute
-            // Update call quality metrics if available
-            callQuality: callDuration > 0 ? 'good' : 'poor',
-            mosScore: callDuration > 0 ? 4.0 : 1.0, // Default MOS score
+            // NOTE: cost and quality fields removed (not in schema)
           },
         });
 
@@ -705,22 +738,7 @@ export async function registerCallsRoutes(app: FastifyInstance) {
           durationSeconds 
         }, 'Successfully updated call status');
       } else {
-        logger.warn({ searchCriteria, callSid, callStatus }, 'No matching call found for status callback');
-        
-        // Also search without status filter to see if call exists at all
-        const anyCall = await prisma.call.findFirst({
-          where: { twilioCallSid: callSid }
-        });
-        
-        if (anyCall) {
-          logger.info({ 
-            callId: anyCall.id, 
-            callStatus: anyCall.status, 
-            twilioCallSid: anyCall.twilioCallSid 
-          }, 'Found call but status not in [queued, in_progress]');
-        } else {
-          logger.warn({ callSid }, 'No call found with this twilioCallSid at all');
-        }
+        logger.warn({ callSid, callStatus }, 'No matching call found for status callback');
       }
     } catch (error) {
       logger.error({ error, callSid, callStatus }, 'Failed to update call status');
@@ -781,6 +799,21 @@ export async function registerCallsRoutes(app: FastifyInstance) {
     if (resolvedAgents.length === 0) {
       return reply.code(400).send({ error: 'No agents resolved' });
     }
+    // Determine call mode for bulk - prioritize callMode, fallback to gateMode mapping
+    let bulkCallMode = body.callMode;
+    if (!bulkCallMode) {
+      // Legacy gateMode mapping
+      if (body.gateMode === 'twilio_amd_bridge' || body.gateMode === 'twilio_amd_handoff') {
+        bulkCallMode = 'conference';
+      } else {
+        // Default: if agentPhoneNumberId is present, use conference mode for AMD
+        bulkCallMode = body.calls.some((_, idx) => {
+          const a = resolvedAgents[idx % resolvedAgents.length]!;
+          return a.agentPhoneNumberId;
+        }) ? 'conference' : 'trunk';
+      }
+    }
+
     const jobs = body.calls.map((c, idx) => {
       const a = resolvedAgents[idx % resolvedAgents.length]!;
       const payload: {
@@ -792,6 +825,12 @@ export async function registerCallsRoutes(app: FastifyInstance) {
         metadata?: Record<string, unknown>;
         variables: Record<string, unknown>;
         campaignId?: string;
+        callMode?: 'trunk' | 'conference';
+        // AMD personalization options
+        machineDetectionTimeout?: number;
+        enableMachineDetection?: boolean;
+        concurrency?: number;
+        // Legacy fields for backward compatibility
         gateMode?: 'twilio_amd_bridge' | 'twilio_amd_handoff';
       } = {
         workspaceId: body.workspaceId,
@@ -800,13 +839,19 @@ export async function registerCallsRoutes(app: FastifyInstance) {
         fromNumber: a.fromNumber,
         toNumber: c.toNumber,
         variables: withDefaultVariables(c.variables),
+        callMode: bulkCallMode,
       };
       if (c.metadata) payload.metadata = c.metadata;
       if (body.campaignId) payload.campaignId = body.campaignId;
-      // For bulk calls, default to twilio_amd_bridge when agentPhoneNumberId is present
-      if (a.agentPhoneNumberId) {
-        payload.gateMode = 'twilio_amd_bridge';
+      
+      // Add AMD personalization options for conference mode
+      if (bulkCallMode === 'conference') {
+        payload.gateMode = 'twilio_amd_bridge'; // Legacy support
+        if (body.machineDetectionTimeout) payload.machineDetectionTimeout = body.machineDetectionTimeout;
+        if (body.enableMachineDetection !== undefined) payload.enableMachineDetection = body.enableMachineDetection;
+        if (body.concurrency) payload.concurrency = body.concurrency;
       }
+      
       return { jobType: 'BULK' as const, payload };
     });
 
