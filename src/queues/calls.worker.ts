@@ -27,7 +27,7 @@ export const callsWorker = new Worker<CreateCallJob>(
     if (gateMode === 'twilio_amd_bridge' && env.TWILIO_ACCOUNT_SID && env.TWILIO_AUTH_TOKEN) {
       // Twilio-only for AMD detection. We will hand off to ElevenLabs after AMD=human via webhook.
       const client = twilio(env.TWILIO_ACCOUNT_SID, env.TWILIO_AUTH_TOKEN);
-      const from = (job.data.payload as any).fromNumber;
+      const from = (job.data.payload as any).fromNumber || (env as any).TWILIO_DEFAULT_FROM || '+34881193139';
       const amdCallback = `${env.PUBLIC_BASE_URL ?? ''}/webhooks/twilio/amd?workspaceId=${encodeURIComponent(payload.workspaceId)}&agentId=${encodeURIComponent(job.data.payload.agentId)}&to=${encodeURIComponent((job.data.payload as any).toNumber)}`;
 
       // Configure AMD options
