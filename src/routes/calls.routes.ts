@@ -51,6 +51,7 @@ const createPrioritySchema = z.object({
   machineDetectionTimeout: z.number().min(1).max(30).optional(),
   enableMachineDetection: z.boolean().optional(),
   concurrency: z.number().min(1).max(100).optional(),
+  gateMode: z.enum(['elevenlabs_direct', 'twilio_amd_bridge', 'twilio_amd_conference', 'twilio_amd_stream']).optional(),
 });
 
 const bulkAgentEntrySchema = z.object({
@@ -67,7 +68,7 @@ const createBulkSchema = z.object({
   fromNumber: z.string().min(5).optional(),
   // New multi-agent distribution
   agents: z.array(bulkAgentEntrySchema).optional(),
-  gateMode: z.enum(['twilio_amd_bridge', 'twilio_amd_handoff']).optional(),
+  gateMode: z.enum(['elevenlabs_direct', 'twilio_amd_bridge', 'twilio_amd_conference', 'twilio_amd_stream']).optional(),
   campaignId: z.string().optional(),
   // AMD personalization options
   machineDetectionTimeout: z.number().min(1).max(30).optional(),
@@ -187,6 +188,34 @@ export async function registerCallsRoutes(app: FastifyInstance) {
       done(e as Error, undefined as any);
     }
   });
+  function getGateMode(request: any, bodyGateMode?: string | undefined): 'elevenlabs_direct' | 'twilio_amd_bridge' | 'twilio_amd_conference' | 'twilio_amd_stream' | undefined {
+    const headerMode = (request.headers['x-gate-mode'] as string | undefined)?.trim();
+    const queryMode = (request.query as any)?.mode as string | undefined;
+    const mode = (bodyGateMode ?? headerMode ?? queryMode) as any;
+    if (mode === 'elevenlabs_direct' || mode === 'twilio_amd_bridge' || mode === 'twilio_amd_conference' || mode === 'twilio_amd_stream') return mode;
+    return undefined;
+  }
+
+  function buildConferenceName(callId: string) {
+    return `conf-${callId}`;
+  }
+
+  function verifyTwilioSignatureOrFail(request: any) {
+    const token = env.TWILIO_AUTH_TOKEN;
+    if (!token) return true; // If not configured, skip
+    const signature = request.headers['x-twilio-signature'] as string | undefined;
+    if (!signature) {
+      throw Object.assign(new Error('Missing Twilio signature'), { statusCode: 403 });
+    }
+    const url = `${env.PUBLIC_BASE_URL ?? ''}${request.raw.url}`;
+    const params = request.body ?? {};
+    const valid = twilio.validateRequest(token, signature, url, params);
+    if (!valid) {
+      throw Object.assign(new Error('Invalid Twilio signature'), { statusCode: 403 });
+    }
+    return true;
+  }
+
   // Admin: provision or fetch workspace API key
   app.post('/workspaces/provision', async (request, reply) => {
     requireAdmin(request);
@@ -467,14 +496,14 @@ export async function registerCallsRoutes(app: FastifyInstance) {
       },
     });
 
-    const gateMode = (request.headers['x-gate-mode'] as string | undefined) ?? (request as any).body?.gateMode;
-    // For AMD bridge, send to worker; otherwise process directly
-    if (gateMode === 'twilio_amd_bridge') {
-      // Send to worker for AMD bridge processing
+    const gateMode = getGateMode(request, body.gateMode as any);
+    logger.info({ route: 'priority', callId: call.id, requestedGateMode: gateMode, header: request.headers['x-gate-mode'], bodyGateMode: body.gateMode }, 'Selected gateMode for priority');
+    if (gateMode === 'twilio_amd_bridge' || gateMode === 'twilio_amd_conference' || gateMode === 'twilio_amd_stream') {
       const { addPriorityCall } = await import('../queues/calls.worker.js');
       await addPriorityCall({
         jobType: 'PRIORITY',
         payload: {
+          callId: call.id,
           workspaceId: body.workspaceId,
           agentId: body.agentId,
           ...(body.agentPhoneNumberId ? { agentPhoneNumberId: body.agentPhoneNumberId } : {}),
@@ -483,13 +512,14 @@ export async function registerCallsRoutes(app: FastifyInstance) {
           ...(body.campaignId ? { campaignId: body.campaignId } : {}),
           ...(body.metadata ? { metadata: body.metadata } : {}),
           variables: withDefaultVariables(body.variables),
+          gateMode,
           // Pass AMD personalization options
           ...(body.machineDetectionTimeout ? { machineDetectionTimeout: body.machineDetectionTimeout } : {}),
           ...(body.enableMachineDetection !== undefined ? { enableMachineDetection: body.enableMachineDetection } : {}),
           ...(body.concurrency ? { concurrency: body.concurrency } : {}),
         },
       });
-      return reply.code(201).send({ created: true, callId: call.id, externalRef: null, mode: 'twilio_amd_bridge' });
+      return reply.code(201).send({ created: true, callId: call.id, externalRef: null, mode: gateMode });
     }
 
     // Process direct calls normally
@@ -516,17 +546,36 @@ export async function registerCallsRoutes(app: FastifyInstance) {
   });
 
   // Twilio: basic answer webhook (TwiML)
-  app.all('/webhooks/twilio/answer', async (_req, reply) => {
+  app.all('/webhooks/twilio/answer', async (req, reply) => {
+    const q = req.query as any;
+    const callId = q?.callId as string | undefined;
+    const mode = getGateMode(req) ?? (q?.mode as any);
+    const callSidFromBody = (req.body as any)?.CallSid as string | undefined;
     const VoiceResponse = twilio.twiml.VoiceResponse;
     const twiml = new VoiceResponse();
-    twiml.pause({ length: 1 });
+    if (mode === 'twilio_amd_stream' && env.PUBLIC_WS_STREAM_URL && callId) {
+      // Normalize to ws/wss scheme
+      let base = env.PUBLIC_WS_STREAM_URL;
+      if (base.startsWith('https://')) base = 'wss://' + base.slice('https://'.length);
+      else if (base.startsWith('http://')) base = 'ws://' + base.slice('http://'.length);
+      const streamUrl = `${base}?callId=${encodeURIComponent(callId)}&sid=${encodeURIComponent(callSidFromBody || '')}&agentId=${encodeURIComponent(q?.agentId || '')}`;
+      logger.info({ callId, streamUrl }, 'Answer TwiML connecting media stream');
+      const connect = (twiml as any).connect();
+      connect.stream({ url: streamUrl });
+      // Keep call active while stream is open
+      twiml.pause({ length: 600 });
+    } else {
+      twiml.pause({ length: 60 });
+    }
     reply.header('Content-Type', 'text/xml');
     return reply.send(twiml.toString());
   });
 
   // Twilio: AMD async callback
   app.post('/webhooks/twilio/amd', async (request, reply) => {
+    verifyTwilioSignatureOrFail(request);
     const params = request.body as Record<string, string>;
+    const callIdFromQuery = (request.query as any)?.callId as string | undefined;
     const workspaceId = (request.query as any)?.workspaceId as string | undefined;
     const agentId = (request.query as any)?.agentId as string | undefined;
     const to = (request.query as any)?.to as string | undefined;
@@ -545,26 +594,18 @@ export async function registerCallsRoutes(app: FastifyInstance) {
       allParams: params 
     }, 'AMD callback received with full details');
 
-    if (!workspaceId || !agentId) {
+    if (!callIdFromQuery && (!workspaceId || !agentId)) {
       logger.warn({ workspaceId, agentId }, 'AMD callback missing required query params');
       return reply.code(200).send('ok');
     }
 
     try {
-      // Match latest queued call for this workspace/agent/(to)
-      const searchCriteria = { 
-        workspaceId,
-        agentId,
-        ...(to ? { to } : {}),
-        status: 'queued',
-      };
-      
-      logger.info({ searchCriteria }, 'Searching for call with criteria');
-      
-      const call = await prisma.call.findFirst({
-        where: searchCriteria,
-        orderBy: { createdAt: 'desc' }
-      });
+      let call = callIdFromQuery
+        ? await prisma.call.findUnique({ where: { id: callIdFromQuery } })
+        : await prisma.call.findFirst({
+            where: { workspaceId: workspaceId!, agentId: agentId!, ...(to ? { to } : {}), status: 'queued' },
+            orderBy: { createdAt: 'desc' },
+          });
 
       if (call) {
         logger.info({ 
@@ -593,34 +634,71 @@ export async function registerCallsRoutes(app: FastifyInstance) {
           twilioCallSid 
         }, 'Successfully updated call with AMD data');
 
-        if (amdStatus === 'human') {
-          const VoiceResponse = twilio.twiml.VoiceResponse;
-          const twiml = new VoiceResponse();
-          twiml.dial({}, '+34881556005');
-          reply.header('Content-Type', 'text/xml');
-          return reply.send(twiml.toString());
+        // For twilio_amd_stream: if machine -> hang up; if human -> leave stream running (answer already started it)
+        if (true) {
+          const requestedMode = getGateMode(request);
+          try {
+            if (!env.TWILIO_ACCOUNT_SID || !env.TWILIO_AUTH_TOKEN) {
+              logger.warn({ callId: call.id }, 'Twilio credentials missing; cannot update call TwiML');
+            } else if (twilioCallSid) {
+              const client = twilio(env.TWILIO_ACCOUNT_SID, env.TWILIO_AUTH_TOKEN);
+              const VoiceResponse = twilio.twiml.VoiceResponse;
+              const twiml = new VoiceResponse();
+              if (requestedMode === 'twilio_amd_stream' && env.PUBLIC_WS_STREAM_URL) {
+                if (amdStatus === 'machine') {
+                  twiml.hangup();
+                  await client.calls(twilioCallSid).update({ twiml: twiml.toString() });
+                  logger.info({ callId: call.id, twilioCallSid }, 'AMD detected machine: hanging up');
+                } else {
+                  // Human: do nothing; answer already started stream
+                  logger.info({ callId: call.id, twilioCallSid }, 'AMD human: keeping stream running');
+                }
+              } else {
+                const conferenceName = buildConferenceName(call.id);
+                const dial = twiml.dial({});
+                dial.conference({ endConferenceOnExit: true, beep: false } as any, conferenceName);
+                await client.calls(twilioCallSid).update({ twiml: twiml.toString() });
+                // Optionally dial ElevenLabs SIP into the conference
+                try {
+                  if (env.ELEVENLABS_SIP_URI) {
+                    const fromNum = (env.TWILIO_FROM_FALLBACK || call.from || '+10000000000') as string;
+                    const toSip = `sip:${env.ELEVENLABS_SIP_URI}`;
+                    const participantTwiML = new twilio.twiml.VoiceResponse();
+                    const d2 = participantTwiML.dial({});
+                    d2.conference({ endConferenceOnExit: true, beep: false } as any, conferenceName);
+                    await client.calls.create({ to: toSip, from: fromNum, twiml: participantTwiML.toString() });
+                  }
+                } catch (err) {
+                  logger.error({ err, callId: call.id }, 'Failed to dial ElevenLabs into conference');
+                }
+                logger.info({ callId: call.id, twilioCallSid, conferenceName }, 'Updated call TwiML to conference');
+              }
+            }
+          } catch (e) {
+            logger.error({ err: e, callId: call.id, twilioCallSid }, 'Failed to update call TwiML after AMD');
+          }
+          // Do not return TwiML here; async AMD callback ignores it. Keep original call alive.
+          return reply.code(200).send('ok');
         }
       } else {
-        logger.warn({ searchCriteria, twilioCallSid }, 'No matching call found for AMD callback');
+        logger.warn({ callIdFromQuery, workspaceId, agentId, to, twilioCallSid }, 'No matching call found for AMD callback');
       }
     } catch (error) {
       logger.error({ error, workspaceId, agentId, to, twilioCallSid }, 'Failed to update AMD metrics');
     }
 
-    const VoiceResponse = twilio.twiml.VoiceResponse;
-    const twiml = new VoiceResponse();
-    twiml.hangup();
-    reply.header('Content-Type', 'text/xml');
-    return reply.send(twiml.toString());
+    return reply.code(200).send('ok');
   });
 
   // Twilio: Status callback webhook for call completion
   app.post('/webhooks/twilio/status', async (request, reply) => {
+    verifyTwilioSignatureOrFail(request);
     const params = request.body as Record<string, string>;
     const callSid = params['CallSid'];
     const callStatus = params['CallStatus'];
     const callDuration = params['CallDuration'] ? parseInt(params['CallDuration']) : 0;
     const answeredBy = params['AnsweredBy'];
+    const callIdFromQuery = (request.query as any)?.callId as string | undefined;
     
     logger.info({ 
       callSid, 
@@ -636,18 +714,9 @@ export async function registerCallsRoutes(app: FastifyInstance) {
     }
 
     try {
-      // Search for call by Twilio Call SID
-      const searchCriteria = { 
-        twilioCallSid: callSid,
-        status: { in: ['queued', 'in_progress'] }
-      };
-      
-      logger.info({ searchCriteria }, 'Searching for call by twilioCallSid');
-      
-      // Find the call record using the Twilio Call SID
-      const call = await prisma.call.findFirst({
-        where: searchCriteria
-      });
+      const call = callIdFromQuery
+        ? await prisma.call.findUnique({ where: { id: callIdFromQuery } })
+        : await prisma.call.findFirst({ where: { twilioCallSid: callSid } });
 
       if (call) {
         logger.info({ 
@@ -689,11 +758,11 @@ export async function registerCallsRoutes(app: FastifyInstance) {
             status: newStatus,
             durationSeconds: durationSeconds,
             // Update costs based on duration
-            costTwilio: callDuration > 0 ? (callDuration / 60) * 0.025 : 0.025, // Twilio cost per minute
-            costElevenLabs: callDuration > 0 ? (callDuration / 60) * 0.15 : 0.15, // ElevenLabs cost per minute
-            // Update call quality metrics if available
+            costTwilio: callDuration > 0 ? (callDuration / 60) * 0.025 : 0.025,
+            // Do not infer ElevenLabs cost from Twilio leg; leave as-is unless set elsewhere
+            // Update call quality metrics if available (rudimentary placeholder)
             callQuality: callDuration > 0 ? 'good' : 'poor',
-            mosScore: callDuration > 0 ? 4.0 : 1.0, // Default MOS score
+            mosScore: callDuration > 0 ? 4.0 : 1.0,
           },
         });
 
@@ -705,7 +774,7 @@ export async function registerCallsRoutes(app: FastifyInstance) {
           durationSeconds 
         }, 'Successfully updated call status');
       } else {
-        logger.warn({ searchCriteria, callSid, callStatus }, 'No matching call found for status callback');
+        logger.warn({ callIdFromQuery, callSid, callStatus }, 'No matching call found for status callback');
         
         // Also search without status filter to see if call exists at all
         const anyCall = await prisma.call.findFirst({
@@ -781,19 +850,25 @@ export async function registerCallsRoutes(app: FastifyInstance) {
     if (resolvedAgents.length === 0) {
       return reply.code(400).send({ error: 'No agents resolved' });
     }
-    const jobs = body.calls.map((c, idx) => {
+    const requestedGateMode = getGateMode(request, body.gateMode);
+    const jobs: { jobType: 'BULK'; payload: any }[] = [];
+    for (let idx = 0; idx < body.calls.length; idx++) {
+      const c = body.calls[idx]!;
       const a = resolvedAgents[idx % resolvedAgents.length]!;
-      const payload: {
-        workspaceId: string;
-        agentId: string;
-        agentPhoneNumberId?: string;
-        fromNumber: string;
-        toNumber: string;
-        metadata?: Record<string, unknown>;
-        variables: Record<string, unknown>;
-        campaignId?: string;
-        gateMode?: 'twilio_amd_bridge' | 'twilio_amd_handoff';
-      } = {
+      const call = await prisma.call.create({
+        data: {
+          workspaceId: body.workspaceId,
+          agentId: a.agentId,
+          campaignId: body.campaignId ?? null,
+          to: c.toNumber,
+          from: a.fromNumber,
+          status: 'queued',
+          priority: 0,
+          metadata: (c.metadata ?? null) as any,
+        },
+      });
+      const payload: any = {
+        callId: call.id,
         workspaceId: body.workspaceId,
         agentId: a.agentId,
         agentPhoneNumberId: a.agentPhoneNumberId,
@@ -803,25 +878,11 @@ export async function registerCallsRoutes(app: FastifyInstance) {
       };
       if (c.metadata) payload.metadata = c.metadata;
       if (body.campaignId) payload.campaignId = body.campaignId;
-      // For bulk calls, default to twilio_amd_bridge when agentPhoneNumberId is present
-      if (a.agentPhoneNumberId) {
-        payload.gateMode = 'twilio_amd_bridge';
-      }
-      return { jobType: 'BULK' as const, payload };
-    });
-
-    await prisma.call.createMany({
-      data: jobs.map((j) => ({
-        workspaceId: j.payload.workspaceId,
-        agentId: j.payload.agentId,
-        campaignId: j.payload.campaignId ?? null,
-        to: j.payload.toNumber,
-        from: j.payload.fromNumber,
-        status: 'queued',
-        priority: 0,
-        metadata: (j.payload.metadata ?? null) as any,
-      })),
-    });
+      // Decide gateMode: respect explicit request; otherwise default by capability
+      payload.gateMode = requestedGateMode ?? (a.agentPhoneNumberId ? 'twilio_amd_conference' : 'elevenlabs_direct');
+      logger.info({ route: 'bulk', callId: call.id, payloadMode: payload.gateMode, header: request.headers['x-gate-mode'], bodyGateMode: body.gateMode }, 'Enqueuing bulk call with gateMode');
+      jobs.push({ jobType: 'BULK' as const, payload });
+    }
 
     if (process.env.DISABLE_WORKERS === '1') {
       return reply.code(202).send({ enqueued: jobs.length, agents: resolvedAgents.map(a => ({ agentId: a.agentId, fromNumber: a.fromNumber })), note: 'Workers disabled: queue skipped' });

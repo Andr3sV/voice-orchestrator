@@ -1,15 +1,23 @@
 import Fastify from 'fastify';
 import { registerCallsRoutes } from './routes/calls.routes.js';
+import fastifyWebsocket from '@fastify/websocket';
+import { registerStreamsRoutes } from './routes/streams.routes.js';
 import { logger } from './lib/logger.js';
 import { env } from './lib/env.js';
 import { redis } from './lib/redis.js';
 
 async function main() {
   const app = Fastify({ logger: true });
+  await app.register(fastifyWebsocket);
+  // Guard: reject non-WS requests to WS path clearly
+  app.get('/ws/stream', async (_req, reply) => {
+    reply.code(426).send({ error: 'Upgrade Required: connect via WebSocket' });
+  });
 
   app.get('/health', async () => ({ status: 'ok' }));
 
   await registerCallsRoutes(app);
+  await registerStreamsRoutes(app);
 
   const port = Number(env.SERVICE_PORT ?? 3000);
 

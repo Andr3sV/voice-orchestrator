@@ -15,6 +15,8 @@ type OptionalEnv = {
 	TWILIO_AUTH_TOKEN?: string;
 	TWILIO_FROM_FALLBACK?: string;
 	PUBLIC_BASE_URL?: string; // e.g., https://voice.ateneai.com
+  ELEVENLABS_SIP_URI?: string; // Optional SIP URI to dial ElevenLabs into a Twilio Conference
+	PUBLIC_WS_STREAM_URL?: string; // WebSocket URL for Twilio Media Streams
 };
 
 type ExtraEnv = {
@@ -42,6 +44,8 @@ export const env: Env = {
 	TWILIO_AUTH_TOKEN: process.env.TWILIO_AUTH_TOKEN,
 	TWILIO_FROM_FALLBACK: process.env.TWILIO_FROM_FALLBACK,
 	PUBLIC_BASE_URL: process.env.PUBLIC_BASE_URL,
+  ELEVENLABS_SIP_URI: process.env.ELEVENLABS_SIP_URI,
+	PUBLIC_WS_STREAM_URL: process.env.PUBLIC_WS_STREAM_URL,
 } as unknown as Env;
 
 

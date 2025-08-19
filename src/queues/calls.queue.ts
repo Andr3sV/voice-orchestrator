@@ -5,6 +5,7 @@ import { redis } from '../lib/redis.js';
 export type CreateCallJob = {
   jobType: 'PRIORITY' | 'BULK';
   payload: {
+    callId: string;
     workspaceId: string;
     agentId: string;
     agentPhoneNumberId?: string;
@@ -13,6 +14,7 @@ export type CreateCallJob = {
     campaignId?: string;
     metadata?: Record<string, unknown>;
     variables?: Record<string, unknown>;
+    gateMode?: 'elevenlabs_direct' | 'twilio_amd_bridge' | 'twilio_amd_conference' | 'twilio_amd_stream';
     // AMD personalization options
     machineDetectionTimeout?: number;
     enableMachineDetection?: boolean;

@@ -11,6 +11,33 @@ type CreateCallJob = import('./calls.queue.js').CreateCallJob;
 
 const defaultConcurrency = Number(process.env.CALLS_WORKER_CONCURRENCY ?? '50');
 
+// Simple Redis-based semaphore per workspace to limit parallel dials
+async function acquireConcurrencySlot(key: string, maxConcurrent: number, ttlSeconds = 60, retryMs = 100, maxWaitMs = 30000): Promise<void> {
+  const script = `
+    local k = KEYS[1]
+    local max = tonumber(ARGV[1])
+    local ttl = tonumber(ARGV[2])
+    local cur = tonumber(redis.call('GET', k) or '0')
+    if cur < max then
+      redis.call('INCR', k)
+      redis.call('EXPIRE', k, ttl)
+      return 1
+    else
+      return 0
+    end
+  `;
+  const start = Date.now();
+  // @ts-ignore ioredis eval signature
+  while ((await (redis as any).eval(script, 1, key, String(maxConcurrent), String(ttlSeconds))) !== 1) {
+    if (Date.now() - start > maxWaitMs) throw new Error(`Concurrency limit reached for ${key}`);
+    await new Promise((r) => setTimeout(r, retryMs));
+  }
+}
+
+async function releaseConcurrencySlot(key: string) {
+  try { await redis.decr(key); } catch {}
+}
+
 export const callsWorker = new Worker<CreateCallJob>(
   'calls-create',
   async (job) => {
@@ -21,18 +48,62 @@ export const callsWorker = new Worker<CreateCallJob>(
       // For true per-job concurrency control, we'd need to implement job-specific workers
     }
     const { payload, jobType } = job.data;
-    // Support gateMode Twilio AMD bridge for bulk
-    const gateMode = (job.data?.payload as any)?.gateMode as 'twilio_amd_bridge' | undefined;
-    console.log('Worker processing job with gateMode:', gateMode, 'payload:', JSON.stringify(job.data?.payload));
-    if (gateMode === 'twilio_amd_bridge' && env.TWILIO_ACCOUNT_SID && env.TWILIO_AUTH_TOKEN) {
-      // For AMD bridge, we need to use SIP trunk to get proper Caller ID presentation
-      // Use ElevenLabs SIP trunk for the actual call, Twilio only for AMD detection
+    const mode = (job.data?.payload as any)?.gateMode as 'elevenlabs_direct' | 'twilio_amd_bridge' | 'twilio_amd_conference' | 'twilio_amd_stream' | undefined;
+    console.log('Worker processing job with gateMode:', mode, 'payload:', JSON.stringify(job.data?.payload));
+    if ((mode === 'twilio_amd_bridge' || mode === 'twilio_amd_conference' || mode === 'twilio_amd_stream') && env.TWILIO_ACCOUNT_SID && env.TWILIO_AUTH_TOKEN) {
+      // Twilio initiates the call and handles AMD; do not call ElevenLabs here
       const client = twilio(env.TWILIO_ACCOUNT_SID, env.TWILIO_AUTH_TOKEN);
-      const from = (job.data.payload as any).fromNumber;
-      const amdCallback = `${env.PUBLIC_BASE_URL ?? ''}/webhooks/twilio/amd?workspaceId=${encodeURIComponent(payload.workspaceId)}&agentId=${encodeURIComponent(job.data.payload.agentId)}&to=${encodeURIComponent((job.data.payload as any).toNumber)}`;
-      
-      // Create call via ElevenLabs SIP trunk first
-      const elevenLabsResult = await elevenLabsClient.createOutboundCall({
+      const from = (payload.fromNumber && payload.fromNumber.length > 0 ? payload.fromNumber : (env.TWILIO_FROM_FALLBACK || '')) as string;
+      if (!from) {
+        throw new Error('Missing from number: provide payload.fromNumber or TWILIO_FROM_FALLBACK');
+      }
+      const base = env.PUBLIC_BASE_URL ?? '';
+      const amdCallback = `${base}/webhooks/twilio/amd?callId=${encodeURIComponent((payload as any).callId)}&workspaceId=${encodeURIComponent(payload.workspaceId)}&agentId=${encodeURIComponent(payload.agentId)}&to=${encodeURIComponent(payload.toNumber)}&mode=${encodeURIComponent(mode ?? '')}`;
+      const statusCallback = `${base}/webhooks/twilio/status?callId=${encodeURIComponent((payload as any).callId)}&mode=${encodeURIComponent(mode ?? '')}`;
+
+      const amdOptions: any = {};
+      if (payload.enableMachineDetection !== false) {
+        amdOptions.machineDetection = 'Enable';
+        amdOptions.machineDetectionTimeout = payload.machineDetectionTimeout ?? 6;
+        amdOptions.asyncAmd = 'true';
+        amdOptions.asyncAmdStatusCallback = amdCallback;
+        amdOptions.amdStatusCallback = amdCallback;
+        amdOptions.amdCallbackMethod = 'POST';
+      }
+      amdOptions.statusCallback = statusCallback;
+      amdOptions.statusCallbackEvent = ['initiated', 'ringing', 'answered', 'completed'];
+      amdOptions.url = `${base}/webhooks/twilio/answer?callId=${encodeURIComponent((payload as any).callId)}&workspaceId=${encodeURIComponent(payload.workspaceId)}&agentId=${encodeURIComponent(payload.agentId)}&to=${encodeURIComponent(payload.toNumber)}&mode=${encodeURIComponent(mode ?? '')}`;
+
+      const limiterKey = `conc:workspace:${payload.workspaceId}`;
+      const maxConc = (payload as any).concurrency ?? defaultConcurrency;
+      await acquireConcurrencySlot(limiterKey, maxConc);
+      let twCall;
+      try {
+        twCall = await client.calls.create({
+          to: payload.toNumber,
+          from,
+          ...amdOptions,
+        });
+      } finally {
+        await releaseConcurrencySlot(limiterKey);
+      }
+
+      try {
+        await prisma.call.update({ where: { id: (payload as any).callId }, data: { twilioCallSid: twCall.sid } });
+      } catch (e) {
+        logger.warn({ err: e, callId: (payload as any).callId }, 'Failed to update call with Twilio SID');
+      }
+
+      logger.info({ jobId: job.id, jobType, mode, twilioCallSid: twCall.sid }, 'Twilio AMD call created');
+      return { callId: twCall.sid, status: 'queued' as const };
+    }
+
+    const limiterKey = `conc:workspace:${payload.workspaceId}`;
+    const maxConc = (payload as any).concurrency ?? defaultConcurrency;
+    await acquireConcurrencySlot(limiterKey, maxConc);
+    let result;
+    try {
+      result = await elevenLabsClient.createOutboundCall({
         workspaceId: payload.workspaceId,
         agentId: payload.agentId,
         agentPhoneNumberId: (payload as any).agentPhoneNumberId,
@@ -41,96 +112,15 @@ export const callsWorker = new Worker<CreateCallJob>(
         metadata: payload.metadata,
         variables: (payload as any).variables,
       });
-
-      // Update call record with ElevenLabs details and estimated costs
-      try {
-        // Find the specific call record to avoid duplicates
-        const call = await prisma.call.findFirst({
-          where: {
-            workspaceId: payload.workspaceId,
-            agentId: payload.agentId,
-            to: payload.toNumber,
-            status: 'queued',
-          },
-          orderBy: { createdAt: 'desc' }
-        });
-
-        if (call) {
-          await prisma.call.update({
-            where: { id: call.id },
-            data: {
-              externalRef: elevenLabsResult.callId,
-              status: elevenLabsResult.status,
-              campaignId: (payload as any).campaignId,
-              // Initialize ElevenLabs cost (will be updated when call completes)
-              costElevenLabs: 0.15, // Estimated cost per minute
-            },
-          });
-        }
-      } catch (e) {
-        logger.warn({ err: e }, 'Failed to update call record with ElevenLabs details');
-      }
-      
-      // Then use Twilio for AMD detection with personalized options
-      const amdOptions: any = {};
-      
-      // Apply personalized AMD settings
-      if (payload.enableMachineDetection !== false) { // Default to true if not specified
-        amdOptions.machineDetection = 'Enable';
-        amdOptions.machineDetectionTimeout = payload.machineDetectionTimeout ?? 6; // Default 6 seconds
-        amdOptions.asyncAmd = 'true';
-        amdOptions.asyncAmdStatusCallback = amdCallback;
-        amdOptions.amdStatusCallback = amdCallback;
-        amdOptions.amdCallbackMethod = 'POST';
-        amdOptions.statusCallback = `${env.PUBLIC_BASE_URL ?? ''}/webhooks/twilio/status`;
-        amdOptions.statusCallbackEvent = ['initiated', 'ringing', 'answered', 'completed'];
-        amdOptions.url = `${env.PUBLIC_BASE_URL ?? ''}/webhooks/twilio/answer`;
-      } else {
-        // If AMD is disabled, just connect the call directly
-        amdOptions.statusCallback = `${env.PUBLIC_BASE_URL ?? ''}/webhooks/twilio/status`;
-        amdOptions.statusCallbackEvent = ['initiated', 'ringing', 'answered', 'completed'];
-        amdOptions.url = `${env.PUBLIC_BASE_URL ?? ''}/webhooks/twilio/answer`;
-      }
-      
-      await client.calls.create({
-        to: job.data.payload.toNumber,
-        from,
-        ...amdOptions,
-      });
-      
-      logger.info({ jobId: job.id, jobType, mode: 'twilio_amd_bridge', elevenLabsCallId: elevenLabsResult.callId }, 'Twilio AMD bridge call created');
-      return { callId: elevenLabsResult.callId, status: elevenLabsResult.status };
+    } finally {
+      await releaseConcurrencySlot(limiterKey);
     }
-
-    const result = await elevenLabsClient.createOutboundCall({
-      workspaceId: payload.workspaceId,
-      agentId: payload.agentId,
-      agentPhoneNumberId: (payload as any).agentPhoneNumberId,
-      fromNumber: payload.fromNumber,
-      toNumber: payload.toNumber,
-      metadata: payload.metadata,
-      variables: (payload as any).variables,
-    });
     logger.info({ jobId: job.id, jobType, result }, 'Call created');
     try {
-      // Find the specific call record to avoid duplicates
-      const call = await prisma.call.findFirst({
-        where: {
-          workspaceId: payload.workspaceId,
-          agentId: payload.agentId,
-          to: payload.toNumber,
-          from: payload.fromNumber,
-          status: 'queued',
-        },
-        orderBy: { createdAt: 'desc' }
+      await prisma.call.update({
+        where: { id: (payload as any).callId },
+        data: { externalRef: result.callId, status: result.status },
       });
-
-      if (call) {
-        await prisma.call.update({
-          where: { id: call.id },
-          data: { externalRef: result.callId, status: result.status },
-        });
-      }
     } catch (e) {
       logger.warn({ err: e }, 'Failed to update call record');
     }
@@ -193,7 +183,7 @@ export async function aggregateDailyFor(dateIso: string) {
         const totalCalls = metrics._count._all || 0;
         const totalTwilioCost = metrics._sum.costTwilio || 0;
         const totalElevenLabsCost = metrics._sum.costElevenLabs || 0;
-        const totalMinutes = metrics._sum.durationSeconds || 0;
+        const totalSeconds = metrics._sum.durationSeconds || 0;
         const totalCost = totalTwilioCost + totalElevenLabsCost;
 
         // Calcular métricas AMD
@@ -204,7 +194,7 @@ export async function aggregateDailyFor(dateIso: string) {
           twilio: totalTwilioCost,
           elevenLabs: totalElevenLabsCost,
           total: totalCost,
-          costPerMinute: totalMinutes > 0 ? totalCost / (totalMinutes / 60) : 0,
+          costPerMinute: totalSeconds > 0 ? totalCost / (totalSeconds / 60) : 0,
           costPerCall: totalCalls > 0 ? totalCost / totalCalls : 0,
         };
 
@@ -225,8 +215,8 @@ export async function aggregateDailyFor(dateIso: string) {
             amdStats,
             costMetrics,
             qualityMetrics,
-            totalMinutes,
-            totalCallsWithDuration: totalMinutes > 0 ? totalCalls : 0,
+            totalMinutes: totalSeconds,
+            totalCallsWithDuration: totalSeconds > 0 ? totalCalls : 0,
           },
           update: { 
             queued: v.queued, 
@@ -237,8 +227,8 @@ export async function aggregateDailyFor(dateIso: string) {
             amdStats,
             costMetrics,
             qualityMetrics,
-            totalMinutes,
-            totalCallsWithDuration: totalMinutes > 0 ? totalCalls : 0,
+            totalMinutes: totalSeconds,
+            totalCallsWithDuration: totalSeconds > 0 ? totalCalls : 0,
           },
         });
       }
@@ -288,7 +278,6 @@ async function calculateAMDAggregatedStats(workspaceId: string, identifier: stri
 
   if (totalDetected > 0) {
     amdStats.totalDetected = totalDetected;
-    amdStats.detectionRate = totalDetected / totalDetected; // 100% si hay detecciones
   }
 
   return amdStats;
