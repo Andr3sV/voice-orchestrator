@@ -9,6 +9,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { aggregateDailyFor, purgeOldCalls } from '../queues/calls.worker.js';
 import { metricsService } from '../lib/metrics.service.js';
 import { logger } from '../lib/logger.js';
+import { callsQueue } from '../queues/calls.queue.js';
 
 // Simple API key auth per workspace
 async function authenticateWorkspace(request: any) {
@@ -229,6 +230,49 @@ export async function registerCallsRoutes(app: FastifyInstance) {
       data: { id: workspaceId, name: name ?? workspaceId, apiKey: `auto_${uuidv4()}` },
     });
     return reply.code(201).send({ workspaceId: created.id, apiKey: created.apiKey });
+  });
+
+  // Cancel a campaign: marks campaign as canceled, removes queued jobs, cancels queued calls
+  app.post('/campaigns/:id/cancel', async (request, reply) => {
+    const ws = await authenticateWorkspace(request);
+    const params = z.object({ id: z.string().min(1) }).parse(request.params);
+    const body = z.object({ workspaceId: z.string().min(1) }).parse(request.body ?? {});
+    if (body.workspaceId !== ws.id) {
+      return reply.code(403).send({ error: 'Forbidden: workspaceId mismatch' });
+    }
+
+    // Ensure campaign belongs to this workspace
+    const campaign = await prisma.campaign.findUnique({ where: { id: params.id } });
+    if (!campaign || campaign.workspaceId !== ws.id) {
+      return reply.code(404).send({ error: 'Campaign not found' });
+    }
+
+    // Mark campaign as canceled
+    await prisma.campaign.update({ where: { id: params.id }, data: { status: 'canceled' } as any });
+
+    // Remove queued/delayed jobs for this campaign
+    const jobTypes: any = ['waiting', 'delayed', 'paused', 'waiting-children'];
+    const jobs = await callsQueue.getJobs(jobTypes, 0, 100000);
+    let removed = 0;
+    for (const job of jobs) {
+      const payload = (job.data as any)?.payload;
+      if (payload?.campaignId === params.id && payload?.workspaceId === ws.id) {
+        try {
+          await job.remove();
+          removed++;
+        } catch (e) {
+          logger.warn({ err: e, jobId: job.id }, 'Failed to remove job during campaign cancel');
+        }
+      }
+    }
+
+    // Cancel queued calls in our DB
+    const updateRes = await prisma.call.updateMany({
+      where: { workspaceId: ws.id, campaignId: params.id, status: 'queued' },
+      data: { status: 'canceled' },
+    });
+
+    return reply.send({ ok: true, campaignId: params.id, removedJobs: removed, canceledQueuedCalls: updateRes.count });
   });
 
   // Admin: inspect workspace (masked apiKey)

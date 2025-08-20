@@ -9,10 +9,6 @@ import { redis } from './lib/redis.js';
 async function main() {
   const app = Fastify({ logger: true });
   await app.register(fastifyWebsocket);
-  // Guard: reject non-WS requests to WS path clearly
-  app.get('/ws/stream', async (_req, reply) => {
-    reply.code(426).send({ error: 'Upgrade Required: connect via WebSocket' });
-  });
 
   app.get('/health', async () => ({ status: 'ok' }));
 
